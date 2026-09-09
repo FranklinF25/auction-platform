@@ -1,0 +1,48 @@
+# Reviewer-facing stack: built images, no source mounts, Postgres kept
+# internal. One-command demo: `docker compose up`, then open http://localhost:3000.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auction
+      POSTGRES_PASSWORD: auction
+      POSTGRES_DB: auction
+    volumes:
+      - auction_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auction -d auction"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./apps/api
+    environment:
+      DATABASE_URL: postgres://auction:auction@postgres:5432/auction?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Distroless has no shell: the binary probes its own /healthz.
+      test: ["CMD", "/api", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  web:
+    build: ./apps/web
+    environment:
+      # Server-side fetches and /api rewrites target the api service directly;
+      # the browser only ever talks to this origin (proxy, no CORS).
+      API_ORIGIN: http://api:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  auction_pgdata:

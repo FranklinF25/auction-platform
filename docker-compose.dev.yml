@@ -1,0 +1,57 @@
+# Dev stack: the same Postgres service as the reviewer stack (same named
+# volume), but with source mounted and hot reload on both sides — air for the
+# Go API, next dev for the web app. Usage:
+#   docker compose -f docker-compose.dev.yml up
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auction
+      POSTGRES_PASSWORD: auction
+      POSTGRES_DB: auction
+    volumes:
+      - auction_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auction -d auction"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    # Air hot-reloads the Go server using apps/api/.air.toml. It is installed
+    # at container start so no custom image has to be maintained; the module
+    # cache volume keeps restarts fast.
+    image: golang:1.23-alpine
+    working_dir: /app
+    command: sh -c "go install github.com/air-verse/air/v1/cmd/air@latest && air -c .air.toml"
+    environment:
+      CGO_ENABLED: "0"
+      DATABASE_URL: postgres://auction:auction@postgres:5432/auction?sslmode=disable
+    volumes:
+      - ./apps/api:/app
+      - go_mod_cache:/go/pkg/mod
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    environment:
+      API_ORIGIN: http://api:8080
+    volumes:
+      - ./apps/web:/app
+      # Anonymous volume keeps the container's node_modules from being
+      # shadowed (and clobbered) by the host mount.
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  auction_pgdata:
+  go_mod_cache:
