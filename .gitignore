@@ -1,0 +1,9 @@
+# Local Pi runtime state
+.atl/
+
+# OpenSpec local artifacts
+openspec/
+
+# Markdown stays local (PRD, notes). Uncomment to publish a README later:
+# !README.md
+*.md
