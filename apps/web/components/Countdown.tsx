@@ -2,9 +2,9 @@
 
 import { useEffect, useState } from "react";
 
-// Client-clock countdown. TODO(M2): derive a server-time offset (from the WS
-// snapshot or a time endpoint) so every client counts down against the API's
-// clock rather than the local browser clock, per the PRD's timer authority.
+// Client-clock countdown, recentered on the server clock by offsetMs (sampled
+// from server_now on every WS frame) per the PRD's "Timer authority" rule: the
+// countdown is a projection of ends_at, never its own source of truth.
 function useNow(intervalMs: number): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -29,14 +29,17 @@ export function formatRemaining(msLeft: number): string {
 
 export default function Countdown({
   endsAt,
+  offsetMs = 0,
   className = "",
 }: {
   endsAt: string;
+  /** Server-clock offset in ms; 0 keeps the raw client clock (static grids). */
+  offsetMs?: number;
   className?: string;
 }) {
   // 250ms keeps the seconds digit from visually skipping on slow timers.
   const now = useNow(250);
-  const msLeft = Date.parse(endsAt) - now;
+  const msLeft = Date.parse(endsAt) - (now + offsetMs);
   const done = msLeft <= 0;
   const urgent = !done && msLeft < 60_000;
 

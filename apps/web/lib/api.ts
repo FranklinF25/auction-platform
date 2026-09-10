@@ -66,6 +66,21 @@ export interface CreateAuctionInput {
   duration_minutes: number;
 }
 
+export interface PlaceBidInput {
+  amount_cents: number;
+}
+
+/** Pinned 201 body for an accepted bid; server_now shares the WS events' emit
+ * instant so the client can recompute its clock offset. */
+export interface PlaceBidResponse {
+  bid_id: string;
+  auction_id: string;
+  amount_cents: number;
+  current_price_cents: number;
+  ends_at: string;
+  server_now: string;
+}
+
 /** Error raised for non-2xx responses, carrying the API's error envelope. */
 export class ApiError extends Error {
   constructor(
@@ -172,6 +187,13 @@ export const api = {
 
   listBids: (id: string, params: ListBidsParams = {}) =>
     request<Page<Bid>>(buildUrl(`/api/auctions/${id}/bids`, params)),
+
+  /** 201 response of POST /api/auctions/{id}/bids (pinned M2 contract). */
+  placeBid: (id: string, input: PlaceBidInput) =>
+    request<PlaceBidResponse>(`/api/auctions/${id}/bids`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 
   createAuction: (input: CreateAuctionInput) =>
     request<Auction>("/api/auctions", {

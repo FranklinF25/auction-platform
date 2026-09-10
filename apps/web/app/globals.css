@@ -4,6 +4,49 @@
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
+
+  /* Live-bidding motion: bid-row entrance, price highlight on bid.placed, and
+     the "+ extended" flash on auction.extended. */
+  --animate-bid-in: bid-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-price-flash: price-flash 1.1s ease-out both;
+  --animate-extended-flash: extended-flash 2.4s ease-out both;
+}
+
+@keyframes bid-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes price-flash {
+  0% {
+    color: rgb(79 70 229); /* indigo-600 */
+    transform: scale(1.04);
+  }
+  100% {
+    color: rgb(24 24 27); /* zinc-900 */
+    transform: scale(1);
+  }
+}
+
+@keyframes extended-flash {
+  0% {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  15%,
+  70% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 body {
