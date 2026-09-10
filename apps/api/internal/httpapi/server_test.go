@@ -14,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,13 +22,29 @@ import (
 
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auction"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auth"
+	"github.com/FranklinF25/auction-platform/apps/api/internal/hub"
 )
 
 var httpBaseTime = time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-type httpFakeClock struct{ t time.Time }
+// httpFakeClock is a mutable fake clock so tests can advance time (soft
+// close) between requests.
+type httpFakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *httpFakeClock) Now() time.Time { return c.t }
+func (c *httpFakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *httpFakeClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = t
+}
 
 type userResp struct {
 	ID    string `json:"id"`
@@ -78,9 +95,8 @@ type errResp struct {
 	} `json:"error"`
 }
 
-func newTestHandler(t *testing.T) (http.Handler, *fakeAuctionRepo) {
+func newTestHandler(t *testing.T, clock *httpFakeClock) (http.Handler, *fakeAuctionRepo) {
 	t.Helper()
-	clock := &httpFakeClock{t: httpBaseTime}
 	authSvc := auth.NewService(
 		&fakeUserRepo{},
 		&fakeSessionStore{sessions: map[string]auth.Session{}},
@@ -88,9 +104,10 @@ func newTestHandler(t *testing.T) (http.Handler, *fakeAuctionRepo) {
 		clock,
 	)
 	auctionRepo := newFakeAuctionRepo()
-	auctionSvc := auction.NewService(auctionRepo, clock)
+	h := hub.New()
+	auctionSvc := auction.NewService(auctionRepo, clock, h)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(authSvc, auctionSvc, logger, Config{CookieSecure: false}), auctionRepo
+	return New(authSvc, auctionSvc, h, clock.Now, logger, Config{CookieSecure: false}), auctionRepo
 }
 
 // doJSON performs a JSON request and decodes the response body into out.
@@ -139,7 +156,7 @@ func doRaw(t *testing.T, client *http.Client, method, url string, body []byte, o
 }
 
 func TestAPISmoke(t *testing.T) {
-	handler, auctionRepo := newTestHandler(t)
+	handler, auctionRepo := newTestHandler(t, &httpFakeClock{t: httpBaseTime})
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 	base := ts.URL

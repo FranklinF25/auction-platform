@@ -3,13 +3,24 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auction"
 )
+
+// querier is the slice of pgx pool/tx methods the queries need, so the same
+// helpers run both against the pool and inside PlaceBid's transaction.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // AuctionRepository implements auction.Repository on PostgreSQL with
 // hand-written pgx queries.
@@ -37,15 +48,32 @@ func (r *AuctionRepository) Create(ctx context.Context, a *auction.Auction) erro
 
 // ByID loads the aggregate including its bid history, oldest first.
 func (r *AuctionRepository) ByID(ctx context.Context, id string) (*auction.Auction, error) {
+	a, err := scanAuction(r.pool.QueryRow(ctx, auctionSelect+`
+WHERE id = $1::uuid`, id))
+	if err != nil {
+		return nil, err
+	}
+	bids, err := listBids(ctx, r.pool, id)
+	if err != nil {
+		return nil, err
+	}
+	a.LoadBids(bids)
+	return a, nil
+}
+
+// auctionSelect is the aggregate's column list; FOR UPDATE is appended by the
+// locked variant used on the bid hot path.
+const auctionSelect = `SELECT id, seller_id, title, description, starting_price_cents,
+       min_increment_cents, reserve_price_cents, status, ends_at,
+       created_at, closed_at
+FROM auctions`
+
+// scanAuction materializes one auction row, mapping pgx's ErrNoRows onto the
+// domain's ErrNotFound.
+func scanAuction(row pgx.Row) (*auction.Auction, error) {
 	a := &auction.Auction{}
 	var status string
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, seller_id, title, description, starting_price_cents,
-		       min_increment_cents, reserve_price_cents, status, ends_at,
-		       created_at, closed_at
-		FROM auctions
-		WHERE id = $1::uuid`, id,
-	).Scan(&a.ID, &a.SellerID, &a.Title, &a.Description, &a.StartingPriceCents,
+	err := row.Scan(&a.ID, &a.SellerID, &a.Title, &a.Description, &a.StartingPriceCents,
 		&a.MinIncrementCents, &a.ReservePriceCents, &status, &a.EndsAt,
 		&a.CreatedAt, &a.ClosedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -55,18 +83,12 @@ func (r *AuctionRepository) ByID(ctx context.Context, id string) (*auction.Aucti
 		return nil, err
 	}
 	a.Status = auction.Status(status)
-
-	bids, err := r.loadBids(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	a.LoadBids(bids)
 	return a, nil
 }
 
-// loadBids returns one auction's bids oldest-first (aggregate order).
-func (r *AuctionRepository) loadBids(ctx context.Context, auctionID string) ([]auction.Bid, error) {
-	rows, err := r.pool.Query(ctx, `
+// listBids returns one auction's bids oldest-first (aggregate order).
+func listBids(ctx context.Context, q querier, auctionID string) ([]auction.Bid, error) {
+	rows, err := q.Query(ctx, `
 		SELECT id, auction_id, bidder_id, amount_cents, created_at
 		FROM bids
 		WHERE auction_id = $1::uuid
@@ -85,6 +107,80 @@ func (r *AuctionRepository) loadBids(ctx context.Context, auctionID string) ([]a
 		bids = append(bids, b)
 	}
 	return bids, rows.Err()
+}
+
+// PlaceBid implements the bid hot path on PostgreSQL.
+//
+// Design note (documented choice, sanctioned by the PRD's "commands over
+// HTTP" model): the transaction is owned by this adapter because only it can
+// BEGIN/COMMIT. All rules stay in the domain — the single domain call is the
+// pure Auction.PlaceBid — while this method orchestrates the IO around it:
+// lock the auction row with SELECT ... FOR UPDATE (the concurrency authority:
+// two bids on the same auction serialize here, first one wins), load the
+// aggregate, let the domain accept or reject, then insert the bid and update
+// ends_at in the same transaction. This keeps lock→load→validate→write→commit
+// atomic with the least ceremony: no unit-of-work abstraction is threaded
+// through the domain port, and the service publishes events only after this
+// method returns, i.e. strictly after COMMIT.
+func (r *AuctionRepository) PlaceBid(ctx context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*auction.PlacedBid, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) // no-op after commit
+
+	// Take the per-auction row lock first; every competing bid waits here.
+	a, err := scanAuction(tx.QueryRow(ctx, auctionSelect+`
+WHERE id = $1::uuid
+FOR UPDATE`, auctionID))
+	if err != nil {
+		return nil, err
+	}
+	bids, err := listBids(ctx, tx, auctionID)
+	if err != nil {
+		return nil, err
+	}
+	a.LoadBids(bids)
+
+	prevEndsAt := a.EndsAt
+	bid, err := a.PlaceBid(bidderID, amountCents, now) // THE rules: pure, no IO
+	if err != nil {
+		if errors.Is(err, auction.ErrBidTooLow) {
+			min := a.CurrentPrice() + a.MinIncrementCents
+			err = fmt.Errorf(
+				"%w: bid must be at least %d cents (current price %d cents plus minimum increment %d cents)",
+				err, min, a.CurrentPrice(), a.MinIncrementCents)
+		}
+		return nil, err
+	}
+
+	// Display name for the event payload, read inside the same transaction.
+	if err := tx.QueryRow(ctx, `SELECT name FROM users WHERE id = $1::uuid`, bidderID).
+		Scan(&bid.BidderName); err != nil {
+		return nil, fmt.Errorf("load bidder: %w", err)
+	}
+
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO bids (auction_id, bidder_id, amount_cents, created_at)
+		VALUES ($1::uuid, $2::uuid, $3, $4)
+		RETURNING id`, auctionID, bidderID, amountCents, now,
+	).Scan(&bid.ID); err != nil {
+		return nil, err
+	}
+
+	extended := a.EndsAt.After(prevEndsAt)
+	if extended {
+		// Anti-sniping soft close moved ends_at; persist the new deadline.
+		if _, err := tx.Exec(ctx, `
+			UPDATE auctions SET ends_at = $2 WHERE id = $1::uuid`, auctionID, a.EndsAt); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &auction.PlacedBid{Bid: bid, Auction: a, Extended: extended}, nil
 }
 
 // listWhere is the shared WHERE fragment for the list query. User input for

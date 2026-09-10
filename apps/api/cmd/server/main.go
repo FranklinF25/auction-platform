@@ -20,6 +20,7 @@ import (
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auction"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auth"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/httpapi"
+	"github.com/FranklinF25/auction-platform/apps/api/internal/hub"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/postgres"
 )
 
@@ -30,6 +31,9 @@ type config struct {
 	CookieSecure  bool
 	RunMigrations bool
 	LogLevel      string
+	// PublicOrigin (API_PUBLIC_ORIGIN) is advertised by GET /api/config so
+	// browsers know where to open WebSocket connections directly.
+	PublicOrigin string
 }
 
 func loadConfig() (config, error) {
@@ -39,6 +43,7 @@ func loadConfig() (config, error) {
 		CookieSecure:  envBool("COOKIE_SECURE", false),
 		RunMigrations: envBool("RUN_MIGRATIONS", true),
 		LogLevel:      envOr("LOG_LEVEL", "info"),
+		PublicOrigin:  envOr("API_PUBLIC_ORIGIN", httpapi.DefaultPublicOrigin),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -140,12 +145,16 @@ func run() error {
 	sessionRepo := postgres.NewSessionRepository(pool)
 	auctionRepo := postgres.NewAuctionRepository(pool)
 
+	// The hub is both the domain's EventPublisher (bids broadcast through it)
+	// and the WS room registry the httpapi adapter subscribes against.
+	h := hub.New()
+
 	authSvc := auth.NewService(userRepo, sessionRepo, auth.BcryptHasher{}, clock)
-	auctionSvc := auction.NewService(auctionRepo, clock)
+	auctionSvc := auction.NewService(auctionRepo, clock, h)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           httpapi.New(authSvc, auctionSvc, logger, httpapi.Config{CookieSecure: cfg.CookieSecure}),
+		Handler:           httpapi.New(authSvc, auctionSvc, h, clock.Now, logger, httpapi.Config{CookieSecure: cfg.CookieSecure, PublicOrigin: cfg.PublicOrigin}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -167,6 +176,12 @@ func run() error {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
 	}
+
+	// Close the hub before draining HTTP: WebSocket connections are hijacked
+	// and never turn idle on their own, so Shutdown would wait them out.
+	// Closing the hub closes every subscriber feed, the write pumps send
+	// their close frames, and the handler goroutines exit.
+	h.Close()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

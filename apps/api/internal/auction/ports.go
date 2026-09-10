@@ -17,6 +17,43 @@ type Clock interface {
 	Now() time.Time
 }
 
+// Event type names on the wire. The full event contract — snake_case JSON
+// field names inside "data", RFC3339 timestamps, a "server_now" field on
+// every state-carrying event so clients can compute their clock offset — is
+// pinned in docs/PRD.md ("Real-time design"); the hub marshals Type and Data
+// verbatim into {"type": ..., "data": ...}.
+const (
+	// EventAuctionState is the full snapshot sent on room join (httpapi builds it).
+	EventAuctionState = "auction.state"
+	// EventBidPlaced is published after a bid transaction commits.
+	EventBidPlaced = "bid.placed"
+	// EventAuctionExtended is published when the soft close moves ends_at.
+	EventAuctionExtended = "auction.extended"
+	// EventAuctionClosed is published by the closing worker (M3).
+	EventAuctionClosed = "auction.closed"
+	// EventPresenceUpdate reports the connected watcher count (hub).
+	EventPresenceUpdate = "presence.update"
+)
+
+// Event is one domain fact broadcast to everyone watching an auction.
+// AuctionID is the routing key (which room the event belongs to); it is
+// mirrored inside Data as "auction_id" on the wire. Data holds the payload
+// per the pinned event contract: snake_case keys, integer cents, time.Time
+// values (RFC3339 on the wire).
+type Event struct {
+	Type      string
+	AuctionID string
+	Data      map[string]any
+}
+
+// EventPublisher fans events out to watchers. Implementations must be safe
+// for concurrent use, must never block the caller (slow consumers are
+// dropped, not waited for) and must tolerate having no watchers. The service
+// stamps Data["server_now"] from the Clock at emit time.
+type EventPublisher interface {
+	Publish(evt Event)
+}
+
 // ListFilter controls the auction list query. Empty Status or Query means
 // "no filter on that dimension".
 type ListFilter struct {
@@ -35,6 +72,19 @@ type Repository interface {
 	// ByID loads one aggregate including its bid history, oldest first.
 	// Returns ErrNotFound when the id does not exist.
 	ByID(ctx context.Context, id string) (*Auction, error)
+	// PlaceBid executes the bid hot path atomically under the database's
+	// authority: BEGIN; SELECT ... FOR UPDATE the auction row; load the
+	// aggregate (auction + bids); apply the domain rules via the pure
+	// Auction.PlaceBid; insert the bid (filling ID and BidderName) and update
+	// ends_at when the soft close extended it; COMMIT. The transaction is
+	// committed before PlaceBid returns, so the service may publish events as
+	// soon as it succeeds — never before.
+	//
+	// Error contract: returns ErrNotFound, or any Auction.PlaceBid sentinel
+	// (ErrNotActive, ErrClosed, ErrOwnAuction, ErrBidTooLow). Implementations
+	// wrap ErrBidTooLow with the concrete numbers (minimum acceptable amount,
+	// current price, increment) so the transport-level message is actionable.
+	PlaceBid(ctx context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*PlacedBid, error)
 	// List returns one page of auction summaries plus the total count
 	// matching the filter.
 	List(ctx context.Context, f ListFilter) (items []ListItem, total int, err error)

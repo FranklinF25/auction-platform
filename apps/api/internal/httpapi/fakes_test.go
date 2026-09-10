@@ -5,6 +5,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,12 +19,13 @@ import (
 type fakeAuctionRepo struct {
 	mu       sync.Mutex
 	auctions map[string]*auction.Auction
+	names    map[string]string // bidder_id -> display name, for PlaceBid payloads
 	nextID   int
 	nextBid  int
 }
 
 func newFakeAuctionRepo() *fakeAuctionRepo {
-	return &fakeAuctionRepo{auctions: map[string]*auction.Auction{}}
+	return &fakeAuctionRepo{auctions: map[string]*auction.Auction{}, names: map[string]string{}}
 }
 
 func (f *fakeAuctionRepo) Create(_ context.Context, a *auction.Auction) error {
@@ -128,6 +130,58 @@ func (f *fakeAuctionRepo) ListBids(_ context.Context, auctionID string, page, pa
 		end = total
 	}
 	return bids[start:end], total, nil
+}
+
+// PlaceBid mirrors the production adapter's contract without the row lock
+// (the fake's mutex plays the serializer): run the pure domain rules, assign
+// ID + bidder name, write back, report whether the soft close moved ends_at.
+// ErrBidTooLow is wrapped with the concrete numbers like the pgx adapter does.
+func (f *fakeAuctionRepo) PlaceBid(_ context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*auction.PlacedBid, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	a, ok := f.auctions[auctionID]
+	if !ok {
+		return nil, auction.ErrNotFound
+	}
+	cp := *a
+	cp.LoadBids(a.Bids())
+	prevEndsAt := cp.EndsAt
+
+	bid, err := cp.PlaceBid(bidderID, amountCents, now)
+	if err != nil {
+		if errors.Is(err, auction.ErrBidTooLow) {
+			min := cp.CurrentPrice() + cp.MinIncrementCents
+			return nil, fmt.Errorf(
+				"%w: bid must be at least %d cents (current price %d cents plus minimum increment %d cents)",
+				err, min, cp.CurrentPrice(), cp.MinIncrementCents)
+		}
+		return nil, err
+	}
+
+	f.nextBid++
+	bid.ID = fmt.Sprintf("bid-%d", f.nextBid)
+	bid.BidderName = f.names[bidderID]
+
+	bids := cp.Bids()
+	bids[len(bids)-1] = bid
+	cp.LoadBids(bids)
+	f.auctions[auctionID] = &cp
+	return &auction.PlacedBid{Bid: bid, Auction: &cp, Extended: cp.EndsAt.After(prevEndsAt)}, nil
+}
+
+// setName registers a bidder's display name for PlaceBid payloads.
+func (f *fakeAuctionRepo) setName(bidderID, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.names[bidderID] = name
+}
+
+// setStatus flips a stored auction's status (test shortcut for closed states).
+func (f *fakeAuctionRepo) setStatus(auctionID string, status auction.Status) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.auctions[auctionID].Status = status
 }
 
 // addBid seeds a bid directly into the stored aggregate (test helper standing
