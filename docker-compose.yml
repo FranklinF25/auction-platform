@@ -19,6 +19,9 @@ services:
     build: ./apps/api
     environment:
       DATABASE_URL: postgres://auction:auction@postgres:5432/auction?sslmode=disable
+      # Browser-reachable origin for direct WebSocket connections (GET
+      # /api/config serves it; ports 3000/8080 share the localhost cookie).
+      API_PUBLIC_ORIGIN: http://localhost:8080
     ports:
       - "8080:8080"
     depends_on:
