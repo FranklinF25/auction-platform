@@ -11,6 +11,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import type { AuctionStatus } from "@/lib/api";
 import type {
+  AuctionClosedData,
   AuctionExtendedData,
   AuctionStateData,
   BidPlacedData,
@@ -32,6 +33,15 @@ export interface LiveBid {
   own: boolean;
 }
 
+/** Post-close outcome: winner display name, sold flag, and the hammer price.
+ * Seeded from the SSR detail for already-closed auctions, replaced by the live
+ * auction.closed event when the close happens mid-session. */
+export interface ClosedOutcome {
+  winnerName: string | null;
+  sold: boolean;
+  finalPriceCents: number;
+}
+
 export interface AuctionLiveState {
   /** Socket lifecycle; "closed" is terminal (auction ended or never live). */
   status: SocketStatus;
@@ -49,6 +59,8 @@ export interface AuctionLiveState {
   lastBid: LiveBid | null;
   /** Date.now() of the last auction.extended frame (drives the flash UI). */
   extendedAt: number | null;
+  /** Set once the auction closes (seed or live event); null while active. */
+  closed: ClosedOutcome | null;
 }
 
 /** Server-rendered seed for the projection; the first auction.state replaces
@@ -59,6 +71,8 @@ export interface AuctionLiveInit {
   bidCount: number;
   endsAt: string;
   reserveMet: boolean;
+  /** Outcome seed for an already-closed auction (SSR winner view). */
+  closed?: ClosedOutcome | null;
 }
 
 /** What applyOwnBid needs from the 201 POST response, plus the bidder's name. */
@@ -105,6 +119,7 @@ type Action =
   | { kind: "state"; data: AuctionStateData; nowMs: number }
   | { kind: "bid"; data: BidPlacedData; nowMs: number }
   | { kind: "extended"; data: AuctionExtendedData; nowMs: number }
+  | { kind: "closed"; data: AuctionClosedData; nowMs: number }
   | { kind: "presence"; data: PresenceData }
   | { kind: "own-bid"; bid: OwnBid; nowMs: number };
 
@@ -187,6 +202,23 @@ function reducer(state: AuctionLiveState, action: Action): AuctionLiveState {
         offsetMs: freshestOffset(d.server_now, action.nowMs, state.offsetMs),
       };
     }
+    case "closed": {
+      // The hammer fell: freeze the projection on the final price and stash
+      // the outcome. The server keeps presence flowing, so watchers keep
+      // updating through the "presence" action.
+      const d = action.data;
+      return {
+        ...state,
+        auctionStatus: "closed",
+        currentPriceCents: d.final_price_cents,
+        closed: {
+          winnerName: d.winner_name,
+          sold: d.sold,
+          finalPriceCents: d.final_price_cents,
+        },
+        offsetMs: freshestOffset(d.server_now, action.nowMs, state.offsetMs),
+      };
+    }
     case "presence":
       return state.watchers === action.data.watchers
         ? state
@@ -223,6 +255,7 @@ function initAuctionLive(initial: AuctionLiveInit): AuctionLiveState {
     bids: [],
     lastBid: null,
     extendedAt: null,
+    closed: initial.closed ?? null,
   };
 }
 
@@ -313,6 +346,15 @@ export function useAuctionSocket(
         case "auction.extended":
           dispatch({ kind: "extended", data: msg.data, nowMs });
           scheduleEndCheck(msg.data.new_ends_at, offsetMs);
+          break;
+        case "auction.closed":
+          // Terminal outcome: stop the projected-end timer and the reconnect
+          // ladder, but keep the socket itself open so presence frames keep
+          // flowing to whoever stays on the page.
+          terminal = true;
+          clearReconnect();
+          clearEnd();
+          dispatch({ kind: "closed", data: msg.data, nowMs });
           break;
         case "presence.update":
           dispatch({ kind: "presence", data: msg.data });

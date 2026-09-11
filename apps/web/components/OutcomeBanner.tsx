@@ -8,11 +8,14 @@ export default function OutcomeBanner({
   bidCount,
   reserveMet,
   currentPriceCents,
+  winnerName,
 }: {
   status: AuctionStatus;
   bidCount: number;
   reserveMet: boolean;
   currentPriceCents: number;
+  /** Winner display name when the closed auction sold; null otherwise. */
+  winnerName?: string | null;
 }) {
   if (status === "cancelled") {
     return (
@@ -27,7 +30,9 @@ export default function OutcomeBanner({
     bidCount === 0
       ? "This auction closed with no bids."
       : reserveMet
-        ? `Sold for ${formatUSD(currentPriceCents)}.`
+        ? winnerName
+          ? `Sold to ${winnerName} for ${formatUSD(currentPriceCents)}.`
+          : `Sold for ${formatUSD(currentPriceCents)}.`
         : "Closed below the seller's reserve — unsold.";
 
   return (

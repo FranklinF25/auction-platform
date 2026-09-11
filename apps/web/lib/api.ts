@@ -26,7 +26,15 @@ export interface Auction {
   bid_count: number;
   status: AuctionStatus;
   ends_at: string;
+  /** Actual close timestamp once the worker closed the auction; null otherwise. Present on list and detail representations. */
+  closed_at: string | null;
   created_at: string;
+  // Detail-only fields (GET /api/auctions/{id}): the paged list endpoints
+  // omit them, so only the detail flow reads them.
+  /** Winner display name iff closed and sold; null otherwise. */
+  winner_name: string | null;
+  /** True iff the requester is authenticated and is the winner. */
+  you_won: boolean;
 }
 
 export interface Bid {
@@ -53,6 +61,18 @@ export type ListAuctionsParams = {
 };
 
 export type ListBidsParams = {
+  page?: number;
+  page_size?: number;
+};
+
+export type ListMyAuctionsParams = {
+  q?: string;
+  status?: AuctionStatus;
+  page?: number;
+  page_size?: number;
+};
+
+export type ListMyPurchasesParams = {
   page?: number;
   page_size?: number;
 };
@@ -187,6 +207,15 @@ export const api = {
 
   listBids: (id: string, params: ListBidsParams = {}) =>
     request<Page<Bid>>(buildUrl(`/api/auctions/${id}/bids`, params)),
+
+  /** Seller dashboard: the signed-in user's own auctions (M3). */
+  listMyAuctions: (params: ListMyAuctionsParams = {}) =>
+    request<Page<Auction>>(buildUrl("/api/users/me/auctions", params)),
+
+  /** Buyer dashboard: auctions the signed-in user won, newest close first. */
+  listMyPurchases: (params: ListMyPurchasesParams = {}) =>
+    request<Page<Auction>>(buildUrl("/api/users/me/purchases", params)),
+
 
   /** 201 response of POST /api/auctions/{id}/bids (pinned M2 contract). */
   placeBid: (id: string, input: PlaceBidInput) =>

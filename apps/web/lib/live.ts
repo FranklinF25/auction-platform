@@ -35,6 +35,15 @@ export interface AuctionExtendedData {
   server_now: string;
 }
 
+export interface AuctionClosedData {
+  auction_id: string;
+  status: "closed";
+  winner_name: string | null;
+  sold: boolean;
+  final_price_cents: number;
+  server_now: string;
+}
+
 export interface PresenceData {
   auction_id: string;
   watchers: number;
@@ -44,6 +53,7 @@ export type WsMessage =
   | { type: "auction.state"; data: AuctionStateData }
   | { type: "bid.placed"; data: BidPlacedData }
   | { type: "auction.extended"; data: AuctionExtendedData }
+  | { type: "auction.closed"; data: AuctionClosedData }
   | { type: "presence.update"; data: PresenceData };
 
 /** Parses one text frame; null for malformed frames or unknown event types. */
@@ -67,6 +77,7 @@ export function parseWsMessage(raw: string): WsMessage | null {
     case "auction.state":
     case "bid.placed":
     case "auction.extended":
+    case "auction.closed":
     case "presence.update":
       return msg as WsMessage;
     default:

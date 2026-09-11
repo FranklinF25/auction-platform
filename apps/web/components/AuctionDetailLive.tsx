@@ -108,6 +108,15 @@ export default function AuctionDetailLive({
     bidCount: auction.bid_count,
     endsAt: auction.ends_at,
     reserveMet: auction.reserve_met,
+    closed:
+      auction.status === "closed"
+        ? {
+            // Per the API contract, winner_name is set iff closed and sold.
+            winnerName: auction.winner_name,
+            sold: auction.winner_name !== null,
+            finalPriceCents: auction.current_price_cents,
+          }
+        : null,
   });
 
   // Same query the Header runs — TanStack dedupes to a single request. A 401
@@ -120,6 +129,17 @@ export default function AuctionDetailLive({
   const me = meQuery.data ?? null;
   const isSeller = me != null && me.id === auction.seller_id;
   const active = live.auctionStatus === "active";
+
+  // Winner view: the live closed event once it lands, else the SSR seed. The
+  // server-rendered fetch is unauthenticated, so you_won is false there; for a
+  // signed-in viewer the display-name match against me lights the banner both
+  // on load and when the close happens mid-session.
+  const winnerName =
+    live.closed?.winnerName ??
+    (auction.status === "closed" ? auction.winner_name : null);
+  const youWon =
+    auction.you_won ||
+    (winnerName != null && me != null && me.name === winnerName);
 
   return (
     <div className="flex flex-col gap-6">
@@ -135,7 +155,20 @@ export default function AuctionDetailLive({
         bidCount={live.bidCount}
         reserveMet={live.reserveMet}
         currentPriceCents={live.currentPriceCents}
+        winnerName={winnerName}
       />
+
+      {youWon ? (
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800">
+          <span>You won this auction — complete your purchase.</span>
+          <Link
+            href="/purchases"
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 font-semibold text-white shadow-sm transition hover:bg-emerald-500"
+          >
+            Complete purchase
+          </Link>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="flex flex-col gap-6 lg:col-span-2">

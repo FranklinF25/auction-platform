@@ -44,6 +44,18 @@ export default function Header() {
           {signedIn ? (
             <>
               <Link
+                href="/dashboard"
+                className="rounded-lg px-3 py-1.5 font-medium text-zinc-700 transition hover:bg-zinc-100"
+              >
+                Dashboard
+              </Link>
+              <Link
+                href="/purchases"
+                className="rounded-lg px-3 py-1.5 font-medium text-zinc-700 transition hover:bg-zinc-100"
+              >
+                Purchases
+              </Link>
+              <Link
                 href="/sell"
                 className="rounded-lg bg-indigo-600 px-3 py-1.5 font-semibold text-white shadow-sm transition hover:bg-indigo-500"
               >

@@ -105,3 +105,124 @@ describe("api.placeBid", () => {
     );
   });
 });
+
+describe("api.listMyAuctions", () => {
+  it("GETs the seller-scoped list with params and parses the page envelope", async () => {
+    const fetchMock = vi.fn<
+      (input: string, init?: RequestInit) => Promise<Response>
+    >(async () =>
+      jsonResponse(200, {
+        items: [
+          {
+            id: "a1",
+            seller_id: "u1",
+            title: "Vintage guitar",
+            description: "",
+            starting_price_cents: 5000,
+            min_increment_cents: 100,
+            current_price_cents: 7500,
+            reserve_met: true,
+            bid_count: 3,
+            status: "active",
+            ends_at: "2026-07-01T00:00:00Z",
+            created_at: "2026-06-01T00:00:00Z",
+          },
+        ],
+        page: 1,
+        page_size: 50,
+        total: 1,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await api.listMyAuctions({
+      q: "guitar",
+      status: "active",
+      page_size: 50,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      `${apiOrigin()}/api/users/me/auctions?q=guitar&status=active&page_size=50`,
+    );
+    expect(init?.method).toBeUndefined(); // plain GET
+    expect(init?.credentials).toBe("include");
+    expect(res.page).toBe(1);
+    expect(res.total).toBe(1);
+    expect(res.items[0].id).toBe("a1");
+    expect(res.items[0].current_price_cents).toBe(7500);
+  });
+
+  it("hits the bare path when no params are given", async () => {
+    const fetchMock = vi.fn<
+      (input: string, init?: RequestInit) => Promise<Response>
+    >(async () =>
+      jsonResponse(200, { items: [], page: 1, page_size: 20, total: 0 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.listMyAuctions();
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `${apiOrigin()}/api/users/me/auctions`,
+    );
+  });
+});
+
+describe("api.listMyPurchases", () => {
+  it("GETs the buyer-scoped won list and parses the page envelope", async () => {
+    const fetchMock = vi.fn<
+      (input: string, init?: RequestInit) => Promise<Response>
+    >(async () =>
+      jsonResponse(200, {
+        items: [
+          {
+            id: "a2",
+            seller_id: "u2",
+            title: "Mechanical keyboard",
+            description: "",
+            starting_price_cents: 2000,
+            min_increment_cents: 50,
+            current_price_cents: 3450,
+            reserve_met: true,
+            bid_count: 7,
+            status: "closed",
+            ends_at: "2026-07-02T00:00:00Z",
+            created_at: "2026-06-20T00:00:00Z",
+          },
+        ],
+        page: 1,
+        page_size: 50,
+        total: 1,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await api.listMyPurchases({ page_size: 50 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${apiOrigin()}/api/users/me/purchases?page_size=50`);
+    expect(init?.method).toBeUndefined(); // plain GET
+    expect(init?.credentials).toBe("include");
+    expect(res.total).toBe(1);
+    expect(res.items[0].title).toBe("Mechanical keyboard");
+    expect(res.items[0].status).toBe("closed");
+  });
+
+  it("hits the bare path when no params are given", async () => {
+    const fetchMock = vi.fn<
+      (input: string, init?: RequestInit) => Promise<Response>
+    >(async () =>
+      jsonResponse(200, { items: [], page: 1, page_size: 20, total: 0 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.listMyPurchases();
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `${apiOrigin()}/api/users/me/purchases`,
+    );
+  });
+});

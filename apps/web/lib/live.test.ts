@@ -143,10 +143,40 @@ describe("parseWsMessage", () => {
     if (presence?.type === "presence.update") {
       expect(presence.data.watchers).toBe(7);
     }
+
+    const closedFrame =
+      '{"type":"auction.closed","data":{"auction_id":"a1","status":"closed",' +
+      '"winner_name":"Ada","sold":true,"final_price_cents":2600,' +
+      '"server_now":"2026-07-01T00:00:01Z"}}';
+    expect(parseWsMessage(closedFrame)).toEqual({
+      type: "auction.closed",
+      data: {
+        auction_id: "a1",
+        status: "closed",
+        winner_name: "Ada",
+        sold: true,
+        final_price_cents: 2600,
+        server_now: "2026-07-01T00:00:01Z",
+      },
+    });
+  });
+
+  it("parses auction.closed with a null winner (unsold close)", () => {
+    const frame =
+      '{"type":"auction.closed","data":{"auction_id":"a1","status":"closed",' +
+      '"winner_name":null,"sold":false,"final_price_cents":2500,' +
+      '"server_now":"2026-07-01T00:00:01Z"}}';
+    const msg = parseWsMessage(frame);
+    expect(msg?.type).toBe("auction.closed");
+    if (msg?.type === "auction.closed") {
+      expect(msg.data.winner_name).toBeNull();
+      expect(msg.data.sold).toBe(false);
+      expect(msg.data.final_price_cents).toBe(2500);
+    }
   });
 
   it("returns null for unknown event types (forward compatibility)", () => {
-    const frame = '{"type":"auction.closed","data":{"auction_id":"a1"}}';
+    const frame = '{"type":"auction.settled","data":{"auction_id":"a1"}}';
     expect(parseWsMessage(frame)).toBeNull();
   });
 

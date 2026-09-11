@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Auction } from "@/lib/api";
+import { isSold } from "@/lib/dashboard";
 import { formatUSD } from "@/lib/money";
 import Countdown from "./Countdown";
 import StatusBadge from "./StatusBadge";
@@ -13,6 +14,11 @@ const gradients = [
   "from-rose-500 to-pink-600",
   "from-fuchsia-500 to-purple-600",
 ];
+
+const closedAtFmt = new Intl.DateTimeFormat("en-US", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
 
 function gradientFor(id: string): string {
   let hash = 0;
@@ -57,8 +63,27 @@ export default function AuctionCard({ auction }: { auction: Auction }) {
         </div>
 
         <div className="mt-auto flex items-center justify-between border-t border-zinc-100 pt-2 text-xs text-zinc-500">
-          <span>{auction.status === "active" ? "Ends in" : "Ended"}</span>
-          <Countdown endsAt={auction.ends_at} />
+          {auction.status === "active" ? (
+            <>
+              <span>Ends in</span>
+              <Countdown endsAt={auction.ends_at} />
+            </>
+          ) : auction.status === "closed" ? (
+            <>
+              <span suppressHydrationWarning>
+                Closed {closedAtFmt.format(new Date(auction.closed_at ?? auction.ends_at))}
+              </span>
+              <span
+                className={`font-semibold ${
+                  isSold(auction) ? "text-emerald-600" : "text-zinc-400"
+                }`}
+              >
+                {isSold(auction) ? "Sold" : "Unsold"}
+              </span>
+            </>
+          ) : (
+            <span>Cancelled</span>
+          )}
         </div>
       </div>
     </Link>
