@@ -76,6 +76,9 @@ func (f *fakeAuctionRepo) List(_ context.Context, flt auction.ListFilter) ([]auc
 			!strings.Contains(strings.ToLower(a.Title), strings.ToLower(flt.Query)) {
 			continue
 		}
+		if flt.SellerID != "" && a.SellerID != flt.SellerID {
+			continue
+		}
 		all = append(all, auction.ListItem{
 			ID:                 a.ID,
 			SellerID:           a.SellerID,
@@ -89,6 +92,7 @@ func (f *fakeAuctionRepo) List(_ context.Context, flt auction.ListFilter) ([]auc
 			Status:             a.Status,
 			EndsAt:             a.EndsAt,
 			CreatedAt:          a.CreatedAt,
+			ClosedAt:           closedAtOf(a),
 		})
 	}
 
@@ -130,6 +134,110 @@ func (f *fakeAuctionRepo) ListBids(_ context.Context, auctionID string, page, pa
 		end = total
 	}
 	return bids[start:end], total, nil
+}
+
+// CloseDue mirrors the production adapter: for every stored auction that is
+// active and due, run the pure domain Close and write the post-close state
+// back (the mutex plays the row lock). Not-closable auctions are skipped.
+func (f *fakeAuctionRepo) CloseDue(_ context.Context, now time.Time) ([]auction.ClosedAuction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Deterministic order, matching the pgx sweep (ends_at, then id).
+	ids := make([]string, 0, len(f.auctions))
+	for id := range f.auctions {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := f.auctions[ids[i]], f.auctions[ids[j]]
+		if a.EndsAt.Equal(b.EndsAt) {
+			return a.ID < b.ID
+		}
+		return a.EndsAt.Before(b.EndsAt)
+	})
+
+	results := []auction.ClosedAuction{}
+	for _, id := range ids {
+		a := f.auctions[id]
+		if a.Status != auction.StatusActive || now.Before(a.EndsAt) {
+			continue
+		}
+		cp := *a
+		cp.LoadBids(a.Bids())
+		winner, won, err := cp.Close(now)
+		if err != nil {
+			continue // not closable under the lock: skip, not fail
+		}
+		f.auctions[id] = &cp
+		results = append(results, auction.ClosedAuction{Auction: &cp, Winner: winner, Won: won})
+	}
+	return results, nil
+}
+
+// ListWon mirrors the production adapter: closed, sold auctions where userID
+// is the highest bidder, ordered by closed_at DESC (a never-closed fake auction
+// counts as the zero time, so it sorts last and never appears anyway).
+func (f *fakeAuctionRepo) ListWon(_ context.Context, userID string, page, pageSize int) ([]auction.ListItem, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ids := make([]string, 0, len(f.auctions))
+	for id := range f.auctions {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := f.auctions[ids[i]], f.auctions[ids[j]]
+		ca, cb := closedAtOf(a), closedAtOf(b)
+		if ca.Equal(cb) {
+			return a.ID > b.ID
+		}
+		return ca.After(cb)
+	})
+
+	all := make([]auction.ListItem, 0, len(ids))
+	for _, id := range ids {
+		a := f.auctions[id]
+		if a.Status != auction.StatusClosed {
+			continue
+		}
+		highest, ok := a.HighestBid()
+		if !ok || highest.BidderID != userID || !a.ReserveMet() {
+			continue
+		}
+		all = append(all, auction.ListItem{
+			ID:                 a.ID,
+			SellerID:           a.SellerID,
+			Title:              a.Title,
+			Description:        a.Description,
+			StartingPriceCents: a.StartingPriceCents,
+			CurrentPriceCents:  a.CurrentPrice(),
+			MinIncrementCents:  a.MinIncrementCents,
+			ReserveMet:         true, // a won auction is sold by definition
+			BidCount:           a.BidCount(),
+			Status:             a.Status,
+			EndsAt:             a.EndsAt,
+			CreatedAt:          a.CreatedAt,
+			ClosedAt:           closedAtOf(a),
+		})
+	}
+
+	total := len(all)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return all[start:end], total, nil
+}
+
+func closedAtOf(a *auction.Auction) time.Time {
+	if a.ClosedAt == nil {
+		return time.Time{}
+	}
+	return *a.ClosedAt
 }
 
 // PlaceBid mirrors the production adapter's contract without the row lock

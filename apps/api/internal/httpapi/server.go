@@ -89,6 +89,10 @@ func New(authSvc *auth.Service, auctionSvc *auction.Service, h wsHub, now func()
 		r.Post("/auth/logout", s.handleLogout)
 		r.Get("/me", s.requireAuth(s.handleMe))
 
+		// The M3 dashboards: the seller's own auctions and the buyer's wins.
+		r.Get("/users/me/auctions", s.requireAuth(s.handleListMyAuctions))
+		r.Get("/users/me/purchases", s.requireAuth(s.handleListMyPurchases))
+
 		r.Post("/auctions", s.requireAuth(s.handleCreateAuction))
 		r.Get("/auctions", s.handleListAuctions)
 		r.Get("/auctions/{id}", s.handleGetAuction)

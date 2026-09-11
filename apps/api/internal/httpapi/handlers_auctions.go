@@ -23,19 +23,23 @@ type createAuctionRequest struct {
 
 // auctionResponse is the public representation of an auction. The reserve
 // price value is intentionally absent: only the reserve-met boolean is public.
+// closed_at is emitted on every representation (detail and list items) as null
+// while the auction is not closed and RFC3339 once it is, so clients render
+// the actual close time instead of deriving it from ends_at.
 type auctionResponse struct {
-	ID                 string    `json:"id"`
-	SellerID           string    `json:"seller_id"`
-	Title              string    `json:"title"`
-	Description        string    `json:"description"`
-	StartingPriceCents int64     `json:"starting_price_cents"`
-	MinIncrementCents  int64     `json:"min_increment_cents"`
-	CurrentPriceCents  int64     `json:"current_price_cents"`
-	ReserveMet         bool      `json:"reserve_met"`
-	BidCount           int       `json:"bid_count"`
-	Status             string    `json:"status"`
-	EndsAt             time.Time `json:"ends_at"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                 string     `json:"id"`
+	SellerID           string     `json:"seller_id"`
+	Title              string     `json:"title"`
+	Description        string     `json:"description"`
+	StartingPriceCents int64      `json:"starting_price_cents"`
+	MinIncrementCents  int64      `json:"min_increment_cents"`
+	CurrentPriceCents  int64      `json:"current_price_cents"`
+	ReserveMet         bool       `json:"reserve_met"`
+	BidCount           int        `json:"bid_count"`
+	Status             string     `json:"status"`
+	EndsAt             time.Time  `json:"ends_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ClosedAt           *time.Time `json:"closed_at"`
 }
 
 func newAuctionResponse(a *auction.Auction) auctionResponse {
@@ -52,11 +56,12 @@ func newAuctionResponse(a *auction.Auction) auctionResponse {
 		Status:             string(a.Status),
 		EndsAt:             a.EndsAt,
 		CreatedAt:          a.CreatedAt,
+		ClosedAt:           a.ClosedAt,
 	}
 }
 
 func newListItemResponse(it auction.ListItem) auctionResponse {
-	return auctionResponse{
+	resp := auctionResponse{
 		ID:                 it.ID,
 		SellerID:           it.SellerID,
 		Title:              it.Title,
@@ -70,6 +75,11 @@ func newListItemResponse(it auction.ListItem) auctionResponse {
 		EndsAt:             it.EndsAt,
 		CreatedAt:          it.CreatedAt,
 	}
+	// The ListItem zero value means "not closed"; on the wire that is null.
+	if !it.ClosedAt.IsZero() {
+		resp.ClosedAt = &it.ClosedAt
+	}
+	return resp
 }
 
 // pageResponse is the shared envelope for paged collections.
@@ -102,8 +112,58 @@ func (s *Server) handleCreateAuction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAuctions(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+	filter, ok := s.parseListQuery(w, r.URL.Query())
+	if !ok {
+		return // error already written
+	}
 
+	result, err := s.auctions.ListAuctions(r.Context(), filter)
+	if err != nil {
+		s.writeDomainError(w, err)
+		return
+	}
+	writeListItemPage(w, result)
+}
+
+// handleListMyAuctions serves the seller dashboard: the same list envelope as
+// GET /api/auctions, scoped to the authenticated seller's own auctions.
+func (s *Server) handleListMyAuctions(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFrom(r.Context())
+	filter, ok := s.parseListQuery(w, r.URL.Query())
+	if !ok {
+		return // error already written
+	}
+	filter.SellerID = user.ID
+
+	result, err := s.auctions.ListAuctions(r.Context(), filter)
+	if err != nil {
+		s.writeDomainError(w, err)
+		return
+	}
+	writeListItemPage(w, result)
+}
+
+// handleListMyPurchases serves the buyer dashboard: auctions the
+// authenticated user has won (closed, sold, highest bidder), newest close
+// first. Losing bids and unsold (reserve-not-met) auctions never appear.
+func (s *Server) handleListMyPurchases(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFrom(r.Context())
+	page, pageSize, ok := s.parsePaging(w, r.URL.Query())
+	if !ok {
+		return // error already written
+	}
+
+	result, err := s.auctions.ListPurchases(r.Context(), user.ID, page, pageSize)
+	if err != nil {
+		s.writeDomainError(w, err)
+		return
+	}
+	writeListItemPage(w, result)
+}
+
+// parseListQuery reads the shared q/status/page/page_size list parameters
+// into a filter. ok=false means the error response has been written.
+func (s *Server) parseListQuery(w http.ResponseWriter, q url.Values) (auction.ListFilter, bool) {
 	filter := auction.ListFilter{Query: strings.TrimSpace(q.Get("q"))}
 	if st := q.Get("status"); st != "" {
 		switch auction.Status(st) {
@@ -111,21 +171,19 @@ func (s *Server) handleListAuctions(w http.ResponseWriter, r *http.Request) {
 			filter.Status = auction.Status(st)
 		default:
 			writeError(w, http.StatusBadRequest, "invalid_query", "status must be active, closed or cancelled")
-			return
+			return filter, false
 		}
 	}
-
 	page, pageSize, ok := s.parsePaging(w, q)
 	if !ok {
-		return // error already written
+		return filter, false // error already written
 	}
 	filter.Page, filter.PageSize = page, pageSize
+	return filter, true
+}
 
-	result, err := s.auctions.ListAuctions(r.Context(), filter)
-	if err != nil {
-		s.writeDomainError(w, err)
-		return
-	}
+// writeListItemPage renders the shared paged-list envelope.
+func writeListItemPage(w http.ResponseWriter, result auction.Page[auction.ListItem]) {
 	items := make([]auctionResponse, 0, len(result.Items))
 	for _, it := range result.Items {
 		items = append(items, newListItemResponse(it))
@@ -146,7 +204,32 @@ func (s *Server) handleGetAuction(w http.ResponseWriter, r *http.Request) {
 		s.writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newAuctionResponse(a))
+
+	// Winner view, derived from the already-loaded bids with the same domain
+	// rules the close uses (HighestBid + ReserveMet): winner_name appears only
+	// on a closed, sold auction; you_won is true only for the authenticated
+	// winner. Never user ids, never the reserve value.
+	detail := auctionDetailResponse{auctionResponse: newAuctionResponse(a)}
+	if a.Status == auction.StatusClosed {
+		if highest, ok := a.HighestBid(); ok && a.ReserveMet() {
+			name := highest.BidderName
+			detail.WinnerName = &name
+			if user, authed := UserFrom(r.Context()); authed && user.ID == highest.BidderID {
+				detail.YouWon = true
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// auctionDetailResponse extends the public representation with the post-close
+// winner view served by GET /api/auctions/{id}: winner_name is null unless the
+// auction closed sold, and you_won tells the authenticated requester whether
+// they are the winner (false for guests and everyone else).
+type auctionDetailResponse struct {
+	auctionResponse
+	WinnerName *string `json:"winner_name"`
+	YouWon     bool    `json:"you_won"`
 }
 
 type bidResponse struct {

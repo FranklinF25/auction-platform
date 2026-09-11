@@ -53,18 +53,19 @@ type userResp struct {
 }
 
 type auctionResp struct {
-	ID                 string    `json:"id"`
-	SellerID           string    `json:"seller_id"`
-	Title              string    `json:"title"`
-	Description        string    `json:"description"`
-	StartingPriceCents int64     `json:"starting_price_cents"`
-	MinIncrementCents  int64     `json:"min_increment_cents"`
-	CurrentPriceCents  int64     `json:"current_price_cents"`
-	ReserveMet         bool      `json:"reserve_met"`
-	BidCount           int       `json:"bid_count"`
-	Status             string    `json:"status"`
-	EndsAt             time.Time `json:"ends_at"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                 string     `json:"id"`
+	SellerID           string     `json:"seller_id"`
+	Title              string     `json:"title"`
+	Description        string     `json:"description"`
+	StartingPriceCents int64      `json:"starting_price_cents"`
+	MinIncrementCents  int64      `json:"min_increment_cents"`
+	CurrentPriceCents  int64      `json:"current_price_cents"`
+	ReserveMet         bool       `json:"reserve_met"`
+	BidCount           int        `json:"bid_count"`
+	Status             string     `json:"status"`
+	EndsAt             time.Time  `json:"ends_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ClosedAt           *time.Time `json:"closed_at"`
 }
 
 type listResp struct {

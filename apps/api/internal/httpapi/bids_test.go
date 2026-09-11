@@ -123,9 +123,9 @@ func TestPlaceBidEndpoint(t *testing.T) {
 		}
 	})
 
-	t.Run("not active: 409 auction_not_active", func(t *testing.T) {
+	t.Run("cancelled: 409 auction_not_active", func(t *testing.T) {
 		created := createAuction(t, sellerClient, base)
-		repo.setStatus(created.ID, auction.StatusClosed)
+		repo.setStatus(created.ID, auction.StatusCancelled)
 		var e errResp
 		resp, _ := doJSON(t, bidderClient, http.MethodPost, base+"/api/auctions/"+created.ID+"/bids",
 			map[string]any{"amount_cents": 1100}, &e)
@@ -134,6 +134,22 @@ func TestPlaceBidEndpoint(t *testing.T) {
 		}
 		if e.Error.Code != "auction_not_active" {
 			t.Errorf("code = %q, want auction_not_active", e.Error.Code)
+		}
+	})
+
+	// Post-close contract: once the closing worker flips the status, a late bid
+	// must answer auction_closed (the honest reason), not auction_not_active.
+	t.Run("closed status: 409 auction_closed", func(t *testing.T) {
+		created := createAuction(t, sellerClient, base)
+		repo.setStatus(created.ID, auction.StatusClosed)
+		var e errResp
+		resp, _ := doJSON(t, bidderClient, http.MethodPost, base+"/api/auctions/"+created.ID+"/bids",
+			map[string]any{"amount_cents": 1100}, &e)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409", resp.StatusCode)
+		}
+		if e.Error.Code != "auction_closed" {
+			t.Errorf("code = %q, want auction_closed", e.Error.Code)
 		}
 	})
 
