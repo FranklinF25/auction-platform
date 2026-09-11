@@ -89,6 +89,14 @@ func (f *placeBidRepo) ListBids(_ context.Context, _ string, _, _ int) ([]auctio
 	return nil, 0, nil
 }
 
+func (f *placeBidRepo) CloseDue(_ context.Context, _ time.Time) ([]auction.ClosedAuction, error) {
+	return nil, nil
+}
+
+func (f *placeBidRepo) ListWon(_ context.Context, _ string, _, _ int) ([]auction.ListItem, int, error) {
+	return nil, 0, nil
+}
+
 func (f *placeBidRepo) PlaceBid(_ context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*auction.PlacedBid, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -344,10 +352,18 @@ func TestPlaceBidErrorPaths(t *testing.T) {
 	}{
 		{
 			name:    "not active",
-			modify:  func(a *auction.Auction) { a.Status = auction.StatusClosed },
+			modify:  func(a *auction.Auction) { a.Status = auction.StatusCancelled },
 			bidder:  "bidder-1",
 			amount:  1100,
 			wantErr: auction.ErrNotActive,
+		},
+		{
+			// Post-close: the status flip alone must surface the honest close reason.
+			name:    "closed status",
+			modify:  func(a *auction.Auction) { a.Status = auction.StatusClosed },
+			bidder:  "bidder-1",
+			amount:  1100,
+			wantErr: auction.ErrClosed,
 		},
 		{
 			name:     "ended",

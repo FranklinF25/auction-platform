@@ -8,9 +8,11 @@ import (
 // Sentinel errors returned by PlaceBid and Close. Adapters map them to
 // transport-level statuses; the domain never depends on transport.
 var (
-	// ErrNotActive: the auction status is not active (already closed or cancelled).
+	// ErrNotActive: the auction status is not active (cancelled, or any other
+	// non-active, non-closed lifecycle state).
 	ErrNotActive = errors.New("auction is not active")
-	// ErrClosed: the auction's end time has passed, so no more bids are accepted.
+	// ErrClosed: the auction has ended — its end time has passed, or it has
+	// already been closed — so no more bids are accepted.
 	ErrClosed = errors.New("auction has ended")
 	// ErrOwnAuction: the seller cannot bid on their own auction.
 	ErrOwnAuction = errors.New("sellers cannot bid on their own auction")
@@ -28,12 +30,18 @@ const softCloseWindow = 60 * time.Second
 // acceptance, appends the bid to the aggregate. A valid bid must be at least
 // CurrentPrice + MinIncrementCents (the starting price stands in for the
 // current price while there are no bids). The seller can never bid on their
-// own auction, bids are rejected once the end time has passed, and a late bid
-// triggers the soft-close extension.
+// own auction, bids are rejected once the auction has ended, and a late bid
+// triggers the soft-close extension. Rejection reasons are kept honest per
+// lifecycle state: a closed auction reports ErrClosed (the close is the
+// reason), a cancelled one reports ErrNotActive, and an active auction past
+// ends_at reports ErrClosed.
 //
 // The returned Bid has no ID yet: persistence assigns it when the bid is
 // stored.
 func (a *Auction) PlaceBid(bidderID string, amountCents int64, now time.Time) (Bid, error) {
+	if a.Status == StatusClosed {
+		return Bid{}, ErrClosed
+	}
 	if a.Status != StatusActive {
 		return Bid{}, ErrNotActive
 	}

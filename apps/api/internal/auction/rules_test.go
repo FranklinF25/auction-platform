@@ -102,16 +102,25 @@ func TestPlaceBidRejectsSellerSelfBid(t *testing.T) {
 	}
 }
 
-func TestPlaceBidRejectsWhenNotActive(t *testing.T) {
-	for _, status := range []auction.Status{auction.StatusClosed, auction.StatusCancelled} {
-		t.Run(string(status), func(t *testing.T) {
-			a := newTestAuction(t)
-			a.Status = status
-			if _, err := a.PlaceBid(bidderA, 1100, baseTime); !errors.Is(err, auction.ErrNotActive) {
-				t.Fatalf("err = %v, want ErrNotActive", err)
-			}
-		})
-	}
+func TestPlaceBidRejectsNonActiveStatus(t *testing.T) {
+	t.Run("cancelled keeps ErrNotActive", func(t *testing.T) {
+		a := newTestAuction(t)
+		a.Status = auction.StatusCancelled
+		if _, err := a.PlaceBid(bidderA, 1100, baseTime); !errors.Is(err, auction.ErrNotActive) {
+			t.Fatalf("err = %v, want ErrNotActive", err)
+		}
+	})
+
+	// Post-close contract: once the closing worker flips the status, the honest
+	// rejection reason is "closed", so the API answers auction_closed (409),
+	// not auction_not_active.
+	t.Run("closed reports ErrClosed", func(t *testing.T) {
+		a := newTestAuction(t)
+		a.Status = auction.StatusClosed
+		if _, err := a.PlaceBid(bidderA, 1100, baseTime); !errors.Is(err, auction.ErrClosed) {
+			t.Fatalf("err = %v, want ErrClosed", err)
+		}
+	})
 }
 
 func TestPlaceBidRejectsAfterEndTime(t *testing.T) {

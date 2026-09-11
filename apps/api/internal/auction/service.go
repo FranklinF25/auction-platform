@@ -96,6 +96,65 @@ func (s *Service) ListBids(ctx context.Context, auctionID string, page, pageSize
 	return Page[Bid]{Items: bids, Page: page, PageSize: pageSize, Total: total}, nil
 }
 
+// ListPurchases returns one page of the auctions the user has won (closed,
+// sold, highest bidder), newest close first. It backs the purchases
+// dashboard; losing bids and unsold (reserve-not-met) auctions never appear.
+func (s *Service) ListPurchases(ctx context.Context, userID string, page, pageSize int) (Page[ListItem], error) {
+	page, pageSize = normalizePaging(page, pageSize)
+	items, total, err := s.repo.ListWon(ctx, userID, page, pageSize)
+	if err != nil {
+		return Page[ListItem]{}, err
+	}
+	return Page[ListItem]{Items: items, Page: page, PageSize: pageSize, Total: total}, nil
+}
+
+// CloseDue is the M3 use case driven by the closer worker: close every
+// auction whose end time has passed. Correctness is owned by the repository
+// exactly like PlaceBid — each auction closes inside its own committed
+// transaction — so this method only issues the command. Events are published
+// only AFTER CloseDue has returned, i.e. strictly after every per-auction
+// transaction has committed; a repository error means nothing was published
+// for the failed pass (per-auction failures are absorbed by the repository,
+// which logs and continues).
+func (s *Service) CloseDue(ctx context.Context) error {
+	results, err := s.repo.CloseDue(ctx, s.clock.Now())
+	if err != nil {
+		return err // repository-level failure: nothing published
+	}
+	emitCloseEvents(s.pub, s.clock, results)
+	return nil
+}
+
+// emitCloseEvents broadcasts auction.closed for every closed auction, with
+// server_now stamped from the domain Clock at emit time. A nil publisher
+// disables broadcasting (nothing depends on it).
+func emitCloseEvents(pub EventPublisher, clock Clock, results []ClosedAuction) {
+	if pub == nil || len(results) == 0 {
+		return
+	}
+	now := clock.Now()
+	for _, res := range results {
+		// winner_name is null unless the auction sold; the payload never
+		// carries user ids, only the winner's display name.
+		var winnerName any
+		if res.Won {
+			winnerName = res.Winner.BidderName
+		}
+		pub.Publish(Event{
+			Type:      EventAuctionClosed,
+			AuctionID: res.Auction.ID,
+			Data: map[string]any{
+				"auction_id":        res.Auction.ID,
+				"status":            string(res.Auction.Status),
+				"winner_name":       winnerName,
+				"sold":              res.Won,
+				"final_price_cents": res.Auction.CurrentPrice(),
+				"server_now":        now,
+			},
+		})
+	}
+}
+
 func normalizePaging(page, pageSize int) (int, int) {
 	if page < DefaultPage {
 		page = DefaultPage

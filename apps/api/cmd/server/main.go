@@ -19,6 +19,7 @@ import (
 
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auction"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/auth"
+	"github.com/FranklinF25/auction-platform/apps/api/internal/closer"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/httpapi"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/hub"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/postgres"
@@ -143,7 +144,7 @@ func run() error {
 	clock := systemClock{}
 	userRepo := postgres.NewUserRepository(pool)
 	sessionRepo := postgres.NewSessionRepository(pool)
-	auctionRepo := postgres.NewAuctionRepository(pool)
+	auctionRepo := postgres.NewAuctionRepository(pool, logger)
 
 	// The hub is both the domain's EventPublisher (bids broadcast through it)
 	// and the WS room registry the httpapi adapter subscribes against.
@@ -167,6 +168,16 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
+	// The M3 closer worker: ticks every second, closing due auctions and
+	// broadcasting auction.closed through the hub after each commit. It runs
+	// on the same signal context; workerDone closes when Run has returned.
+	worker := closer.NewWorker(auctionSvc, logger, closer.DefaultInterval)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		worker.Run(ctx)
+	}()
+
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -175,6 +186,16 @@ func run() error {
 		return nil
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
+	}
+
+	// Stop the closer worker BEFORE closing the hub: cancellation makes Run
+	// return only after the in-flight close pass finishes, so its auction.closed
+	// events still reach the hub and flush to watchers. The bound only guards
+	// against a wedged pass holding shutdown hostage.
+	select {
+	case <-workerDone:
+	case <-time.After(10 * time.Second):
+		logger.Warn("closer worker did not stop in time; proceeding")
 	}
 
 	// Close the hub before draining HTTP: WebSocket connections are hijacked

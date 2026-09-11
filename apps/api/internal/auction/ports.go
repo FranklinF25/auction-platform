@@ -54,13 +54,26 @@ type EventPublisher interface {
 	Publish(evt Event)
 }
 
-// ListFilter controls the auction list query. Empty Status or Query means
-// "no filter on that dimension".
+// ListFilter controls the auction list query. Empty Status, Query or
+// SellerID means "no filter on that dimension"; the seller dashboard sets
+// SellerID to scope the list to one seller's own auctions.
 type ListFilter struct {
 	Status   Status
 	Query    string // case-insensitive title substring match
+	SellerID string
 	Page     int
 	PageSize int
+}
+
+// ClosedAuction is the outcome of closing one auction: the post-close
+// aggregate (status closed, closed_at set) plus the domain-determined winner.
+// Won is false when the auction closed unsold (no bids, or reserve not met),
+// in which case Winner is the zero Bid. When Won is true the persistence
+// layer fills Winner.BidderName so close events need no extra lookup.
+type ClosedAuction struct {
+	Auction *Auction
+	Winner  Bid
+	Won     bool
 }
 
 // Repository persists and reads Auction aggregates. Declared on the consumer
@@ -81,7 +94,8 @@ type Repository interface {
 	// soon as it succeeds — never before.
 	//
 	// Error contract: returns ErrNotFound, or any Auction.PlaceBid sentinel
-	// (ErrNotActive, ErrClosed, ErrOwnAuction, ErrBidTooLow). Implementations
+	// (ErrNotActive for a cancelled auction, ErrClosed for one already closed
+	// or past ends_at, ErrOwnAuction, ErrBidTooLow). Implementations
 	// wrap ErrBidTooLow with the concrete numbers (minimum acceptable amount,
 	// current price, increment) so the transport-level message is actionable.
 	PlaceBid(ctx context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*PlacedBid, error)
@@ -91,11 +105,28 @@ type Repository interface {
 	// ListBids returns one page of bids for one auction, newest first,
 	// including bidder names. Paging normalization happens in the service.
 	ListBids(ctx context.Context, auctionID string, page, pageSize int) (bids []Bid, total int, err error)
+	// CloseDue closes every active auction whose ends_at has passed as of now,
+	// one transaction per auction (same locked pattern as PlaceBid: BEGIN; SELECT
+	// ... FOR UPDATE; load aggregate; pure Auction.Close; persist status and
+	// closed_at; COMMIT), so one failing auction never rolls back the others —
+	// implementations log a failed auction and continue. Each transaction is
+	// committed before CloseDue returns, so the service may publish close events
+	// as soon as it succeeds — never before. Auctions that turn out not to be
+	// closable anymore (soft-close extension moved ends_at past now, or the
+	// auction is no longer active) are skipped without being reported as errors.
+	CloseDue(ctx context.Context, now time.Time) ([]ClosedAuction, error)
+	// ListWon returns one page of auctions the user has won — closed, sold
+	// (reserve met) and userID is the highest bidder — ordered by closed_at
+	// DESC, plus the total count. Paging normalization happens in the service.
+	ListWon(ctx context.Context, userID string, page, pageSize int) (items []ListItem, total int, err error)
 }
 
 // ListItem is a read model for list endpoints: auction fields plus the
 // derived values (current price, reserve met, bid count) computed by the
 // query. Like the detail representation it never carries the reserve value.
+// ClosedAt is the close timestamp; the zero value means "not closed" (still
+// active or cancelled), so representations can render the actual close time
+// instead of deriving it from EndsAt.
 type ListItem struct {
 	ID                 string
 	SellerID           string
@@ -109,4 +140,5 @@ type ListItem struct {
 	Status             Status
 	EndsAt             time.Time
 	CreatedAt          time.Time
+	ClosedAt           time.Time
 }

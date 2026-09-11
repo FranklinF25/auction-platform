@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -25,12 +26,18 @@ type querier interface {
 // AuctionRepository implements auction.Repository on PostgreSQL with
 // hand-written pgx queries.
 type AuctionRepository struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	logger *slog.Logger
 }
 
-// NewAuctionRepository returns an AuctionRepository backed by pool.
-func NewAuctionRepository(pool *pgxpool.Pool) *AuctionRepository {
-	return &AuctionRepository{pool: pool}
+// NewAuctionRepository returns an AuctionRepository backed by pool. The
+// logger reports per-auction failures inside CloseDue (which continues past
+// them); a nil logger falls back to the default one.
+func NewAuctionRepository(pool *pgxpool.Pool, logger *slog.Logger) *AuctionRepository {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &AuctionRepository{pool: pool, logger: logger}
 }
 
 // Create inserts an auction and fills in the database-generated ID and
@@ -86,13 +93,16 @@ func scanAuction(row pgx.Row) (*auction.Auction, error) {
 	return a, nil
 }
 
-// listBids returns one auction's bids oldest-first (aggregate order).
+// listBids returns one auction's bids oldest-first (aggregate order), with
+// bidder display names joined from users — the aggregate's bid history is the
+// single source for winner derivation, so names travel with the bids.
 func listBids(ctx context.Context, q querier, auctionID string) ([]auction.Bid, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, auction_id, bidder_id, amount_cents, created_at
-		FROM bids
-		WHERE auction_id = $1::uuid
-		ORDER BY created_at ASC`, auctionID)
+		SELECT b.id, b.auction_id, b.bidder_id, b.amount_cents, b.created_at, u.name
+		FROM bids b
+		JOIN users u ON u.id = b.bidder_id
+		WHERE b.auction_id = $1::uuid
+		ORDER BY b.created_at ASC`, auctionID)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +111,7 @@ func listBids(ctx context.Context, q querier, auctionID string) ([]auction.Bid, 
 	bids := []auction.Bid{}
 	for rows.Next() {
 		var b auction.Bid
-		if err := rows.Scan(&b.ID, &b.AuctionID, &b.BidderID, &b.AmountCents, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.AuctionID, &b.BidderID, &b.AmountCents, &b.CreatedAt, &b.BidderName); err != nil {
 			return nil, err
 		}
 		bids = append(bids, b)
@@ -184,9 +194,12 @@ FOR UPDATE`, auctionID))
 }
 
 // listWhere is the shared WHERE fragment for the list query. User input for
-// the ILIKE filter is escaped by escapeLike so it matches literally.
+// the ILIKE filter is escaped by escapeLike so it matches literally. A NULL
+// seller_id parameter means "any seller" (the public list); the seller
+// dashboard passes the seller's uuid to scope the query.
 const listWhere = `($1::text IS NULL OR status = $1::text)
-	AND ($2::text IS NULL OR title ILIKE '%' || $2::text || '%')`
+	AND ($2::text IS NULL OR title ILIKE '%' || $2::text || '%')
+	AND ($3::uuid IS NULL OR seller_id = $3::uuid)`
 
 // List returns one page of auction summaries plus the total count. Derived
 // values (current price, reserve met, bid count) are computed in SQL so the
@@ -200,10 +213,14 @@ func (r *AuctionRepository) List(ctx context.Context, f auction.ListFilter) ([]a
 	if f.Query != "" {
 		query = escapeLike(f.Query)
 	}
+	var seller any
+	if f.SellerID != "" {
+		seller = f.SellerID
+	}
 
 	var total int
 	err := r.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM auctions WHERE `+listWhere, status, query,
+		`SELECT COUNT(*) FROM auctions WHERE `+listWhere, status, query, seller,
 	).Scan(&total)
 	if err != nil {
 		return nil, 0, err
@@ -212,7 +229,7 @@ func (r *AuctionRepository) List(ctx context.Context, f auction.ListFilter) ([]a
 	offset := (f.Page - 1) * f.PageSize
 	rows, err := r.pool.Query(ctx, `
 		SELECT a.id, a.seller_id, a.title, a.description, a.starting_price_cents,
-		       a.min_increment_cents, a.status, a.ends_at, a.created_at,
+		       a.min_increment_cents, a.status, a.ends_at, a.created_at, a.closed_at,
 		       COALESCE(b.max_amount, a.starting_price_cents) AS current_price_cents,
 		       (a.reserve_price_cents IS NULL
 		         OR COALESCE(b.max_amount, a.starting_price_cents) >= a.reserve_price_cents) AS reserve_met,
@@ -225,7 +242,7 @@ func (r *AuctionRepository) List(ctx context.Context, f auction.ListFilter) ([]a
 		) b ON b.auction_id = a.id
 		WHERE `+listWhere+`
 		ORDER BY a.created_at DESC, a.id
-		LIMIT $3 OFFSET $4`, status, query, f.PageSize, offset)
+		LIMIT $4 OFFSET $5`, status, query, seller, f.PageSize, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -235,12 +252,18 @@ func (r *AuctionRepository) List(ctx context.Context, f auction.ListFilter) ([]a
 	for rows.Next() {
 		var it auction.ListItem
 		var st string
+		// closed_at is NULL until the closing sweep runs; nil scans to the
+		// ListItem zero value ("not closed").
+		var closedAt *time.Time
 		if err := rows.Scan(&it.ID, &it.SellerID, &it.Title, &it.Description,
-			&it.StartingPriceCents, &it.MinIncrementCents, &st, &it.EndsAt, &it.CreatedAt,
+			&it.StartingPriceCents, &it.MinIncrementCents, &st, &it.EndsAt, &it.CreatedAt, &closedAt,
 			&it.CurrentPriceCents, &it.ReserveMet, &it.BidCount); err != nil {
 			return nil, 0, err
 		}
 		it.Status = auction.Status(st)
+		if closedAt != nil {
+			it.ClosedAt = *closedAt
+		}
 		items = append(items, it)
 	}
 	return items, total, rows.Err()
@@ -279,6 +302,171 @@ func (r *AuctionRepository) ListBids(ctx context.Context, auctionID string, page
 		bids = append(bids, b)
 	}
 	return bids, total, rows.Err()
+}
+
+// CloseDue implements the M3 closing sweep on PostgreSQL. It follows the
+// same tx-owned-by-adapter discipline as PlaceBid: every auction closes in
+// its own transaction (BEGIN; SELECT ... FOR UPDATE; load aggregate; pure
+// Auction.Close; persist status + closed_at; COMMIT), so one failing auction
+// rolls back only itself — the failure is logged and the sweep continues. The
+// initial id scan is a plain read; per-auction correctness is re-established
+// under the row lock, where a soft-close extension that moved ends_at past
+// now (or a status change) simply skips that auction for this pass.
+func (r *AuctionRepository) CloseDue(ctx context.Context, now time.Time) ([]auction.ClosedAuction, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id FROM auctions
+		WHERE status = 'active' AND ends_at <= $1
+		ORDER BY ends_at, id`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	results := []auction.ClosedAuction{}
+	for _, id := range ids {
+		res, err := r.closeOne(ctx, id, now)
+		if err != nil {
+			// One bad auction must not roll back the others: log and continue.
+			r.logger.Error("close auction failed", "auction_id", id, "err", err)
+			continue
+		}
+		if res != nil {
+			results = append(results, *res)
+		}
+	}
+	return results, nil
+}
+
+// closeOne closes a single due auction inside its own transaction and returns
+// the post-close result. A nil result with a nil error means the auction turned
+// out not to be closable under the lock (no longer active, or ends_at moved
+// past now via the soft close) and was skipped.
+func (r *AuctionRepository) closeOne(ctx context.Context, id string, now time.Time) (*auction.ClosedAuction, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) // no-op after commit
+
+	// Serialize with bids and any other closer under the per-auction row lock.
+	a, err := scanAuction(tx.QueryRow(ctx, auctionSelect+`
+WHERE id = $1::uuid
+FOR UPDATE`, id))
+	if err != nil {
+		return nil, err
+	}
+	bids, err := listBids(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	a.LoadBids(bids)
+
+	winner, won, err := a.Close(now) // THE rules: pure, no IO
+	if err != nil {
+		if errors.Is(err, auction.ErrNotClosable) || errors.Is(err, auction.ErrNotActive) {
+			return nil, nil // state moved on since the id scan: skip, not fail
+		}
+		return nil, err
+	}
+
+	// Winner's display name for the close event payload, read inside the same
+	// transaction so the lock covers the full close decision.
+	if won {
+		if err := tx.QueryRow(ctx, `SELECT name FROM users WHERE id = $1::uuid`, winner.BidderID).
+			Scan(&winner.BidderName); err != nil {
+			return nil, fmt.Errorf("load winner: %w", err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE auctions SET status = $2, closed_at = $3 WHERE id = $1::uuid`,
+		id, string(a.Status), a.ClosedAt); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &auction.ClosedAuction{Auction: a, Winner: winner, Won: won}, nil
+}
+
+// wonTopBid is the shared CTE picking each auction's winning bid: the highest
+// amount, ties broken by earliest placement, matching the domain's
+// HighestBid semantics (bids load oldest-first, strictly-greater wins).
+const wonTopBid = `SELECT DISTINCT ON (b.auction_id)
+		b.auction_id, b.bidder_id, b.amount_cents
+		FROM bids b
+		ORDER BY b.auction_id, b.amount_cents DESC, b.created_at ASC, b.id ASC`
+
+// ListWon returns one page of auctions the user has won: closed, sold
+// (reserve met) and the user is the highest bidder, newest close first.
+func (r *AuctionRepository) ListWon(ctx context.Context, userID string, page, pageSize int) ([]auction.ListItem, int, error) {
+	// A won auction always has at least one bid, and every accepted bid is at
+	// least starting price + increment, so the top bid is the current price.
+	const itemSelect = `SELECT a.id, a.seller_id, a.title, a.description, a.starting_price_cents,
+		       a.min_increment_cents, a.status, a.ends_at, a.created_at, a.closed_at,
+		       top.amount_cents AS current_price_cents,
+		       COALESCE(cnt.bid_count, 0) AS bid_count
+		FROM auctions a
+		JOIN (` + wonTopBid + `) top ON top.auction_id = a.id
+		LEFT JOIN (
+			SELECT auction_id, COUNT(*) AS bid_count FROM bids GROUP BY auction_id
+		) cnt ON cnt.auction_id = a.id
+		WHERE a.status = 'closed'
+		  AND top.bidder_id = $1::uuid
+		  AND (a.reserve_price_cents IS NULL OR top.amount_cents >= a.reserve_price_cents)
+		ORDER BY a.closed_at DESC, a.id
+		LIMIT $2 OFFSET $3`
+
+	var total int
+	err := r.pool.QueryRow(ctx, `SELECT COUNT(*)
+		FROM auctions a
+		JOIN (`+wonTopBid+`) top ON top.auction_id = a.id
+		WHERE a.status = 'closed'
+		  AND top.bidder_id = $1::uuid
+		  AND (a.reserve_price_cents IS NULL OR top.amount_cents >= a.reserve_price_cents)`, userID,
+	).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	rows, err := r.pool.Query(ctx, itemSelect, userID, pageSize, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := []auction.ListItem{}
+	for rows.Next() {
+		var it auction.ListItem
+		var st string
+		var closedAt *time.Time // NULL never happens for a closed auction, but scan defensively
+		if err := rows.Scan(&it.ID, &it.SellerID, &it.Title, &it.Description,
+			&it.StartingPriceCents, &it.MinIncrementCents, &st, &it.EndsAt, &it.CreatedAt, &closedAt,
+			&it.CurrentPriceCents, &it.BidCount); err != nil {
+			return nil, 0, err
+		}
+		it.Status = auction.Status(st)
+		it.ReserveMet = true // a won auction is sold by definition
+		if closedAt != nil {
+			it.ClosedAt = *closedAt
+		}
+		items = append(items, it)
+	}
+	return items, total, rows.Err()
 }
 
 // escapeLike neutralizes LIKE wildcards in user input so q matches literally.
