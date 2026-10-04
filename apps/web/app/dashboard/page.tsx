@@ -1,10 +1,11 @@
 "use client";
 
-// Seller dashboard (M3): the signed-in user's own auctions with client-side
-// outcome stat chips, status tabs, and cards that drill into the detail page
-// (which already carries the full bid history). Revenue stats are deferred to
-// the M4 checkout milestone. Auth follows the /sell pattern: guests are bounced
-// to /login, other failures stay visible.
+// Seller dashboard (M3 + M4 revenue strip): the signed-in user's own auctions
+// with client-side outcome stat chips, status tabs, and cards that drill into
+// the detail page (which already carries the full bid history). The M4 sales
+// summary (completed / pending / revenue) comes from GET /api/users/me/sales.
+// Auth follows the /sell pattern: guests are bounced to /login, other failures
+// stay visible.
 
 import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
@@ -18,6 +19,7 @@ import {
   type SellerStats,
   type SellerTab,
 } from "@/lib/dashboard";
+import { formatUSD } from "@/lib/money";
 
 const TABS: { value: SellerTab; label: string }[] = [
   { value: "all", label: "All" },
@@ -56,6 +58,14 @@ export default function DashboardPage() {
   const auctionsQuery = useQuery({
     queryKey: ["my-auctions"],
     queryFn: () => api.listMyAuctions({ page_size: 50 }),
+    enabled: meQuery.data != null,
+  });
+
+  // M4 revenue strip: server-side sales aggregates. A failed fetch just omits
+  // the strip — the auction list above carries its own error handling.
+  const salesQuery = useQuery({
+    queryKey: ["my-sales"],
+    queryFn: () => api.mySales(),
     enabled: meQuery.data != null,
   });
 
@@ -102,6 +112,28 @@ export default function DashboardPage() {
             {chip.label}
           </span>
         ))}
+        {salesQuery.data ? (
+          <>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-100 px-3 py-1 text-xs font-semibold text-indigo-700">
+              <span className="tabular-nums">
+                {salesQuery.data.completed_sales}
+              </span>
+              Completed sales
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700">
+              <span className="tabular-nums">
+                {salesQuery.data.pending_sales}
+              </span>
+              Pending sales
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700">
+              <span className="tabular-nums">
+                {formatUSD(salesQuery.data.revenue_cents)}
+              </span>
+              Revenue
+            </span>
+          </>
+        ) : null}
       </div>
 
       <div

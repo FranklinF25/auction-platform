@@ -37,6 +37,42 @@ export interface Auction {
   you_won: boolean;
 }
 
+// -- M4 checkout types ------------------------------------------------------
+
+/** Checkout lifecycle of a won auction's transaction (disjoint from
+ * AuctionStatus despite the string-union shape). */
+export type TransactionStatus = "pending" | "completed" | "failed" | "expired";
+
+/** The transaction view embedded in each purchases item: what is owed, the
+ * payment state, and the remaining payment window. */
+export interface Transaction {
+  id: string;
+  status: TransactionStatus;
+  amount_cents: number;
+  expires_at: string;
+  /** Set once the payment completed; null otherwise. */
+  paid_at: string | null;
+}
+
+/** A purchases-list item: the auction representation plus its checkout
+ * transaction (additive M4 join — every prior Auction field keeps its shape). */
+export type Purchase = Auction & { transaction: Transaction };
+
+/** GET /api/users/me/sales: the seller's checkout aggregates. */
+export interface SalesSummary {
+  completed_sales: number;
+  pending_sales: number;
+  revenue_cents: number;
+}
+
+/** Pinned 200 body of POST /api/transactions/{id}/pay. A declined card is a
+ * 200 with status "failed" and paid_at null; "completed" carries paid_at. */
+export interface PayTransactionResponse {
+  transaction_id: string;
+  status: "completed" | "failed";
+  paid_at: string | null;
+}
+
 export interface Bid {
   id: string;
   bidder_name: string;
@@ -212,9 +248,21 @@ export const api = {
   listMyAuctions: (params: ListMyAuctionsParams = {}) =>
     request<Page<Auction>>(buildUrl("/api/users/me/auctions", params)),
 
-  /** Buyer dashboard: auctions the signed-in user won, newest close first. */
+  /** Buyer dashboard: auctions the signed-in user won, newest close first,
+   * each joined with its checkout transaction (M4). */
   listMyPurchases: (params: ListMyPurchasesParams = {}) =>
-    request<Page<Auction>>(buildUrl("/api/users/me/purchases", params)),
+    request<Page<Purchase>>(buildUrl("/api/users/me/purchases", params)),
+
+  /** Seller revenue aggregates for the dashboard strip (M4). */
+  mySales: () => request<SalesSummary>("/api/users/me/sales"),
+
+  /** Simulated payment for a transaction the user won (M4). A decline is a
+   * 200 with status "failed", not an error — see PayTransactionResponse. */
+  payTransaction: (transactionId: string, cardNumber: string) =>
+    request<PayTransactionResponse>(`/api/transactions/${transactionId}/pay`, {
+      method: "POST",
+      body: JSON.stringify({ card_number: cardNumber }),
+    }),
 
 
   /** 201 response of POST /api/auctions/{id}/bids (pinned M2 contract). */

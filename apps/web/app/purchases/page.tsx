@@ -1,9 +1,10 @@
 "use client";
 
-// Buyer dashboard (M3): auctions the signed-in user won, newest close first.
-// Checkout is simulated in this build — the disabled CTA marks where the M4
-// payment flow lands. Auth follows the /sell pattern: guests are bounced to
-// /login, other failures stay visible.
+// Buyer dashboard (M4): auctions the signed-in user won, newest close first,
+// each joined with its checkout transaction. The row action is state-aware:
+// pending offers checkout, failed retries it, completed shows the paid chip,
+// expired means the sale is lost. Auth follows the /sell pattern: guests are
+// bounced to /login, other failures stay visible.
 
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
@@ -11,10 +12,15 @@ import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { primaryButtonClass } from "@/components/formStyles";
 import { EmptyState, ErrorState } from "@/components/States";
-import { ApiError, api, type Auction } from "@/lib/api";
+import { ApiError, api, type Purchase } from "@/lib/api";
 import { formatUSD } from "@/lib/money";
 
 const wonAtFmt = new Intl.DateTimeFormat("en-US", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
+const paidAtFmt = new Intl.DateTimeFormat("en-US", {
   dateStyle: "medium",
   timeStyle: "short",
 });
@@ -23,7 +29,45 @@ function RowSkeleton() {
   return <div className="h-28 animate-pulse rounded-2xl border border-zinc-200 bg-white" />;
 }
 
-function PurchaseRow({ purchase }: { purchase: Auction }) {
+// The per-purchase action, derived from the transaction status: pending ->
+// checkout CTA, failed -> retry CTA plus a muted note, completed -> emerald
+// paid chip with the payment date, expired -> muted lost note.
+function PurchaseAction({ purchase }: { purchase: Purchase }) {
+  const { transaction } = purchase;
+
+  if (transaction.status === "completed") {
+    return (
+      <div className="flex flex-col items-start gap-2 sm:items-end">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700">
+          Paid
+        </span>
+        {transaction.paid_at ? (
+          <p className="text-xs text-zinc-500">
+            <span suppressHydrationWarning>
+              Paid {paidAtFmt.format(new Date(transaction.paid_at))}
+            </span>
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (transaction.status === "expired") {
+    return <p className="text-xs font-medium text-zinc-400">Expired — sale lost</p>;
+  }
+
+  const failed = transaction.status === "failed";
+  return (
+    <div className="flex flex-col items-start gap-2 sm:items-end">
+      <Link href={`/checkout/${transaction.id}`} className={primaryButtonClass}>
+        {failed ? "Retry payment" : "Complete purchase"}
+      </Link>
+      {failed ? <p className="text-xs text-zinc-500">Payment failed</p> : null}
+    </div>
+  );
+}
+
+function PurchaseRow({ purchase }: { purchase: Purchase }) {
   return (
     <div className="flex flex-col gap-4 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0">
@@ -45,15 +89,7 @@ function PurchaseRow({ purchase }: { purchase: Auction }) {
         <p className="text-lg font-bold tabular-nums text-zinc-900">
           {formatUSD(purchase.current_price_cents)}
         </p>
-        <button
-          type="button"
-          disabled
-          title="Simulated checkout ships in M4"
-          className={primaryButtonClass}
-        >
-          Complete purchase
-        </button>
-        <p className="text-xs text-zinc-400">Simulated checkout ships in M4.</p>
+        <PurchaseAction purchase={purchase} />
       </div>
     </div>
   );
