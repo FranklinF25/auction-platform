@@ -4,9 +4,10 @@
 # OpenSpec local artifacts
 openspec/
 
-# Markdown stays local (PRD, notes); the README is the published front door:
+# Markdown stays local (PRD, notes); the READMEs are the published front door:
 *.md
 !README.md
+!README.es.md
 
 # CodeGraph index (MCP tooling state)
 .codegraph/

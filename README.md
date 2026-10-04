@@ -1,5 +1,7 @@
 # Auction Platform
 
+**English** | [Español](README.es.md)
+
 [![CI](https://github.com/FranklinF25/auction-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/FranklinF25/auction-platform/actions/workflows/ci.yml)
 
 A real-time auction platform built as a portfolio piece: Go (chi) API, PostgreSQL 16, Next.js App Router front end, all wired with Docker Compose. Bids placed in one browser appear in every other browser watching the same auction within milliseconds, last-second bids extend the timer (soft close), auctions close on their own, and winners pay through a simulated checkout with a full payment state machine. Run `docker compose up` and the demo landscape below is seeded automatically — two logged-in browser profiles are all you need to evaluate it end to end.
