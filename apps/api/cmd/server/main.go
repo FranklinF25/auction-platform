@@ -23,6 +23,7 @@ import (
 	"github.com/FranklinF25/auction-platform/apps/api/internal/httpapi"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/hub"
 	"github.com/FranklinF25/auction-platform/apps/api/internal/postgres"
+	"github.com/FranklinF25/auction-platform/apps/api/internal/seed"
 )
 
 // config is read from plain environment variables — no config library.
@@ -35,6 +36,9 @@ type config struct {
 	// PublicOrigin (API_PUBLIC_ORIGIN) is advertised by GET /api/config so
 	// browsers know where to open WebSocket connections directly.
 	PublicOrigin string
+	// SeedDemo (SEED_DEMO) creates the demo accounts and auction landscape
+	// after migrations; idempotent, skips when already applied.
+	SeedDemo bool
 }
 
 func loadConfig() (config, error) {
@@ -45,6 +49,7 @@ func loadConfig() (config, error) {
 		RunMigrations: envBool("RUN_MIGRATIONS", true),
 		LogLevel:      envOr("LOG_LEVEL", "info"),
 		PublicOrigin:  envOr("API_PUBLIC_ORIGIN", httpapi.DefaultPublicOrigin),
+		SeedDemo:      envBool("SEED_DEMO", false),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -146,6 +151,18 @@ func run() error {
 	sessionRepo := postgres.NewSessionRepository(pool)
 	auctionRepo := postgres.NewAuctionRepository(pool, logger)
 
+	// Demo seed (SEED_DEMO): idempotent demo accounts and auctions, applied
+	// before the server starts serving so the first page load sees them.
+	if cfg.SeedDemo {
+		if err := seed.Run(ctx, seed.Deps{
+			Users:    userRepo,
+			Hasher:   auth.BcryptHasher{},
+			Auctions: auctionRepo,
+		}, logger, clock.Now()); err != nil {
+			return fmt.Errorf("seed demo data: %w", err)
+		}
+	}
+
 	// The hub is both the domain's EventPublisher (bids broadcast through it)
 	// and the WS room registry the httpapi adapter subscribes against.
 	h := hub.New()
@@ -178,6 +195,16 @@ func run() error {
 		worker.Run(ctx)
 	}()
 
+	// The M4 expiry worker: ticks every 30 seconds, expiring checkout
+	// transactions whose 48-hour payment window has closed. Same driving
+	// pattern and shutdown contract as the closer worker.
+	expiryWorker := closer.NewExpiryWorker(auctionSvc, logger, closer.DefaultExpiryInterval)
+	expiryDone := make(chan struct{})
+	go func() {
+		defer close(expiryDone)
+		expiryWorker.Run(ctx)
+	}()
+
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -188,14 +215,16 @@ func run() error {
 		logger.Info("shutdown signal received")
 	}
 
-	// Stop the closer worker BEFORE closing the hub: cancellation makes Run
-	// return only after the in-flight close pass finishes, so its auction.closed
-	// events still reach the hub and flush to watchers. The bound only guards
-	// against a wedged pass holding shutdown hostage.
-	select {
-	case <-workerDone:
-	case <-time.After(10 * time.Second):
-		logger.Warn("closer worker did not stop in time; proceeding")
+	// Stop BOTH background workers BEFORE closing the hub: cancellation makes
+	// Run return only after each in-flight pass finishes, so close events and
+	// expiry writes still flush before the hub and pool go away. The bound only
+	// guards against a wedged pass holding shutdown hostage.
+	for _, done := range []chan struct{}{workerDone, expiryDone} {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			logger.Warn("background worker did not stop in time; proceeding")
+		}
 	}
 
 	// Close the hub before draining HTTP: WebSocket connections are hijacked
