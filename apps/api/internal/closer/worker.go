@@ -1,7 +1,9 @@
-// Package closer holds the background worker that drives the M3 close sweep:
-// on a fixed tick it asks the auction service to close every auction whose
-// end time has passed. Hexagonal rule: concurrency lives in this adapter —
-// the domain stays pure and synchronous; this package only schedules calls.
+// Package closer holds the background workers that drive the periodic sweeps:
+// the M3 close worker (auctions whose end time has passed) and the M4 expiry
+// worker (checkout transactions whose 48-hour payment window has closed). On
+// a fixed tick each worker asks the auction service for one pass.
+// Hexagonal rule: concurrency lives in this adapter — the domain stays pure
+// and synchronous; this package only schedules calls.
 package closer
 
 import (
@@ -46,15 +48,22 @@ func NewWorker(svc DueCloser, logger *slog.Logger, interval time.Duration) *Work
 	return &Worker{svc: svc, logger: logger, interval: interval}
 }
 
-// Run ticks until ctx is cancelled. Each tick starts one close pass in its own
-// goroutine unless the previous pass is still running — a slow pass makes the
-// worker skip ticks, never overlap them (CloseDue is safe to call
-// concurrently, but overlap would only add lock contention for nothing).
-// Run returns once ctx is cancelled AND the in-flight pass, if any, has
-// finished: a started pass always runs to completion on a context detached
-// from cancellation, so its close events still flush during shutdown.
+// Run ticks until ctx is cancelled, then drains the in-flight pass (see
+// runLoop).
 func (w *Worker) Run(ctx context.Context) {
-	ticker := time.NewTicker(w.interval)
+	runLoop(ctx, w.logger, w.interval, "close pass", w.svc.CloseDue)
+}
+
+// runLoop is the shared tick engine behind the package's workers. Each tick
+// starts one pass of fn in its own goroutine unless the previous pass is
+// still running — a slow pass makes the loop skip ticks, never overlap them
+// (the passes are safe to call concurrently, but overlap would only add lock
+// contention for nothing). It returns once ctx is cancelled AND the in-flight
+// pass, if any, has finished: a started pass always runs to completion on a
+// context detached from cancellation, so its effects still flush during
+// shutdown. label names the pass in the skip/error log lines.
+func runLoop(ctx context.Context, logger *slog.Logger, interval time.Duration, label string, fn func(context.Context) error) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	var inFlight atomic.Bool
@@ -68,7 +77,7 @@ func (w *Worker) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if !inFlight.CompareAndSwap(false, true) {
-				w.logger.Debug("close pass still running; skipping tick")
+				logger.Debug(label + " still running; skipping tick")
 				continue
 			}
 			wg.Add(1)
@@ -76,9 +85,9 @@ func (w *Worker) Run(ctx context.Context) {
 				defer wg.Done()
 				defer inFlight.Store(false)
 				// Detached from ctx: a started pass completes even while the
-				// worker is shutting down, so its events reach the hub.
-				if err := w.svc.CloseDue(context.WithoutCancel(ctx)); err != nil {
-					w.logger.Error("close pass failed", "err", err)
+				// worker is shutting down, so its effects reach the adapters.
+				if err := fn(context.WithoutCancel(ctx)); err != nil {
+					logger.Error(label+" failed", "err", err)
 				}
 			}()
 		}

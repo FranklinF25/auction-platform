@@ -18,17 +18,22 @@ import (
 )
 
 // closeDueRepo is an in-memory Repository whose CloseDue mirrors the
-// production adapter: run the pure domain Close on every active, due auction
-// and write the post-close state back before returning. fail forces a
-// repository-level error to exercise the service's error path.
+// production adapter: run the pure domain Close on every active, due auction,
+// write the post-close state back before returning, and on a sold close
+// insert the pending checkout transaction in the same critical section (M4).
+// fail forces a repository-level error to exercise the service's error path.
 type closeDueRepo struct {
-	mu     sync.Mutex
-	stored map[string]*auction.Auction
-	fail   bool
+	mu           sync.Mutex
+	stored       map[string]*auction.Auction
+	transactions map[string]*auction.Transaction
+	fail         bool
 }
 
 func newCloseDueRepo(auctions ...*auction.Auction) *closeDueRepo {
-	r := &closeDueRepo{stored: map[string]*auction.Auction{}}
+	r := &closeDueRepo{
+		stored:       map[string]*auction.Auction{},
+		transactions: map[string]*auction.Transaction{},
+	}
 	for _, a := range auctions {
 		r.stored[a.ID] = a
 	}
@@ -100,9 +105,62 @@ func (f *closeDueRepo) CloseDue(_ context.Context, now time.Time) ([]auction.Clo
 			continue // not active or not due: skip, not fail
 		}
 		f.stored[id] = &cp // COMMIT: post-close state is durable from here on
-		results = append(results, auction.ClosedAuction{Auction: &cp, Winner: winner, Won: won})
+		res := auction.ClosedAuction{Auction: &cp, Winner: winner, Won: won}
+		if won {
+			// Same critical section as the pgx per-auction transaction: the
+			// pending payment is durable together with the close.
+			txn := &auction.Transaction{
+				ID:          "tx-" + id,
+				AuctionID:   id,
+				WinnerID:    winner.BidderID,
+				AmountCents: cp.CurrentPrice(),
+				Status:      auction.TransactionPending,
+				CreatedAt:   now,
+				ExpiresAt:   now.Add(auction.TransactionExpiryDuration),
+			}
+			f.transactions[txn.ID] = txn
+			res.Transaction = txn
+		}
+		results = append(results, res)
 	}
 	return results, nil
+}
+
+// M4 port additions. TransactionByID/CreateTransaction are honest (the
+// close tests assert the sweep's transactions); the rest are minimal stubs
+// this fake does not exercise.
+func (f *closeDueRepo) CreateTransaction(_ context.Context, t *auction.Transaction) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transactions[t.ID] = t
+	return nil
+}
+
+func (f *closeDueRepo) TransactionByID(_ context.Context, id string) (*auction.Transaction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.transactions[id]
+	if !ok {
+		return nil, auction.ErrNotFound
+	}
+	cp := *t
+	return &cp, nil
+}
+
+func (f *closeDueRepo) PayTransaction(_ context.Context, _ string, _ string, _ time.Time) (*auction.Transaction, error) {
+	return nil, auction.ErrNotFound
+}
+
+func (f *closeDueRepo) ExpireDueTransactions(_ context.Context, _ time.Time) (int, error) {
+	return 0, nil
+}
+
+func (f *closeDueRepo) ListMyTransactions(_ context.Context, _ string, _, _ int) ([]auction.PurchaseItem, int, error) {
+	return nil, 0, nil
+}
+
+func (f *closeDueRepo) SellerSales(_ context.Context, _ string) (int, int, int64, error) {
+	return 0, 0, 0, nil
 }
 
 // closeEventPublisher records every event and, at publish time, verifies the
@@ -245,6 +303,49 @@ func TestCloseDuePublishesClosedEventsAfterCommit(t *testing.T) {
 	}
 	if byID["auction-unsold-nobids"].Data["final_price_cents"] != int64(1000) {
 		t.Errorf("unsold-nobids final_price_cents = %v, want 1000", byID["auction-unsold-nobids"].Data["final_price_cents"])
+	}
+}
+
+// TestCloseDueCreatesPendingTransaction pins the M4 checkout handoff: a
+// sold close creates the pending transaction (final price, 48h window)
+// atomically with the close, while unsold closes create none.
+func TestCloseDueCreatesPendingTransaction(t *testing.T) {
+	sold := seedLot("auction-sold", nil,
+		bidOf("bidder-1", "Ada", 1100, closeBaseTime.Add(time.Minute)),
+		bidOf("bidder-2", "Grace", 2000, closeBaseTime.Add(2*time.Minute)))
+	unsold := seedLot("auction-unsold-reserve", int64Ptr(5000),
+		bidOf("bidder-1", "Ada", 3000, closeBaseTime.Add(time.Minute)))
+	zeroBids := seedLot("auction-unsold-nobids", nil)
+	repo := newCloseDueRepo(sold, unsold, zeroBids)
+	pub := &closeEventPublisher{repo: repo}
+	clock := &mutableClock{t: closeBaseTime.Add(15 * time.Minute)} // past ends_at
+	svc := auction.NewService(repo, clock, pub)
+
+	if err := svc.CloseDue(context.Background()); err != nil {
+		t.Fatalf("CloseDue: %v", err)
+	}
+
+	// Sold: pending transaction carried on the result and persisted.
+	t1, err := repo.TransactionByID(context.Background(), "tx-auction-sold")
+	if err != nil {
+		t.Fatalf("load transaction for the sold lot: %v", err)
+	}
+	if t1.Status != auction.TransactionPending {
+		t.Errorf("status = %q, want pending", t1.Status)
+	}
+	if t1.WinnerID != "bidder-2" {
+		t.Errorf("winner_id = %q, want bidder-2 (the highest bidder)", t1.WinnerID)
+	}
+	if t1.AmountCents != 2000 {
+		t.Errorf("amount_cents = %d, want the final price 2000", t1.AmountCents)
+	}
+	if want := clock.Now().Add(auction.TransactionExpiryDuration); !t1.ExpiresAt.Equal(want) {
+		t.Errorf("expires_at = %v, want close time + 48h (%v)", t1.ExpiresAt, want)
+	}
+
+	// Unsold (reserve not met, zero bids): no transactions at all.
+	if got := len(repo.transactions); got != 1 {
+		t.Fatalf("stored transactions = %d, want exactly 1 (the sold lot)", got)
 	}
 }
 

@@ -17,15 +17,21 @@ import (
 )
 
 type fakeAuctionRepo struct {
-	mu       sync.Mutex
-	auctions map[string]*auction.Auction
-	names    map[string]string // bidder_id -> display name, for PlaceBid payloads
-	nextID   int
-	nextBid  int
+	mu           sync.Mutex
+	auctions     map[string]*auction.Auction
+	names        map[string]string // bidder_id -> display name, for PlaceBid payloads
+	nextID       int
+	nextBid      int
+	nextTx       int
+	transactions map[string]*auction.Transaction
 }
 
 func newFakeAuctionRepo() *fakeAuctionRepo {
-	return &fakeAuctionRepo{auctions: map[string]*auction.Auction{}, names: map[string]string{}}
+	return &fakeAuctionRepo{
+		auctions:     map[string]*auction.Auction{},
+		names:        map[string]string{},
+		transactions: map[string]*auction.Transaction{},
+	}
 }
 
 func (f *fakeAuctionRepo) Create(_ context.Context, a *auction.Auction) error {
@@ -137,8 +143,10 @@ func (f *fakeAuctionRepo) ListBids(_ context.Context, auctionID string, page, pa
 }
 
 // CloseDue mirrors the production adapter: for every stored auction that is
-// active and due, run the pure domain Close and write the post-close state
-// back (the mutex plays the row lock). Not-closable auctions are skipped.
+// active and due, run the pure domain Close, write the post-close state back
+// (the mutex plays the row lock), and on a sold close insert the pending
+// checkout transaction in the same critical section — same shape as the pgx
+// per-auction transaction. Not-closable auctions are skipped.
 func (f *fakeAuctionRepo) CloseDue(_ context.Context, now time.Time) ([]auction.ClosedAuction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -169,7 +177,22 @@ func (f *fakeAuctionRepo) CloseDue(_ context.Context, now time.Time) ([]auction.
 			continue // not closable under the lock: skip, not fail
 		}
 		f.auctions[id] = &cp
-		results = append(results, auction.ClosedAuction{Auction: &cp, Winner: winner, Won: won})
+		res := auction.ClosedAuction{Auction: &cp, Winner: winner, Won: won}
+		if won {
+			f.nextTx++
+			txn := &auction.Transaction{
+				ID:          fmt.Sprintf("00000000-0000-0000-0000-%012d", f.nextTx),
+				AuctionID:   id,
+				WinnerID:    winner.BidderID,
+				AmountCents: cp.CurrentPrice(),
+				Status:      auction.TransactionPending,
+				CreatedAt:   now,
+				ExpiresAt:   now.Add(auction.TransactionExpiryDuration),
+			}
+			f.transactions[txn.ID] = txn
+			res.Transaction = txn
+		}
+		results = append(results, res)
 	}
 	return results, nil
 }
@@ -231,6 +254,158 @@ func (f *fakeAuctionRepo) ListWon(_ context.Context, userID string, page, pageSi
 		end = total
 	}
 	return all[start:end], total, nil
+}
+
+// transactionByAuction returns the stored transaction for an auction id.
+func (f *fakeAuctionRepo) transactionByAuction(auctionID string) (*auction.Transaction, bool) {
+	for _, t := range f.transactions {
+		if t.AuctionID == auctionID {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// CreateTransaction stores t and assigns a test id (mirrors the port).
+func (f *fakeAuctionRepo) CreateTransaction(_ context.Context, t *auction.Transaction) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextTx++
+	t.ID = fmt.Sprintf("00000000-0000-0000-0000-%012d", f.nextTx)
+	f.transactions[t.ID] = t
+	return nil
+}
+
+// TransactionByID mirrors the port: ErrNotFound when absent.
+func (f *fakeAuctionRepo) TransactionByID(_ context.Context, id string) (*auction.Transaction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.transactions[id]
+	if !ok {
+		return nil, auction.ErrNotFound
+	}
+	cp := *t
+	return &cp, nil
+}
+
+// PayTransaction mirrors the production adapter: run the pure Transaction.Pay
+// on the stored row (the mutex plays the row lock) and persist the outcome,
+// including a decline's failed status.
+func (f *fakeAuctionRepo) PayTransaction(_ context.Context, id, cardNumber string, now time.Time) (*auction.Transaction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.transactions[id]
+	if !ok {
+		return nil, auction.ErrNotFound
+	}
+	cp := *t
+	if err := cp.Pay(cardNumber, now); err != nil {
+		return nil, err
+	}
+	f.transactions[id] = &cp
+	return &cp, nil
+}
+
+// ExpireDueTransactions mirrors the single-UPDATE sweep over the fake store.
+func (f *fakeAuctionRepo) ExpireDueTransactions(_ context.Context, now time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, t := range f.transactions {
+		if (t.Status == auction.TransactionPending || t.Status == auction.TransactionFailed) &&
+			!now.Before(t.ExpiresAt) {
+			t.Status = auction.TransactionExpired
+			count++
+		}
+	}
+	return count, nil
+}
+
+// ListMyTransactions mirrors the production read model: won auctions (closed,
+// sold, highest bidder) joined with their transaction, closed_at DESC.
+func (f *fakeAuctionRepo) ListMyTransactions(_ context.Context, userID string, page, pageSize int) ([]auction.PurchaseItem, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ids := make([]string, 0, len(f.auctions))
+	for id := range f.auctions {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := f.auctions[ids[i]], f.auctions[ids[j]]
+		ca, cb := closedAtOf(a), closedAtOf(b)
+		if ca.Equal(cb) {
+			return a.ID > b.ID
+		}
+		return ca.After(cb)
+	})
+
+	all := make([]auction.PurchaseItem, 0, len(ids))
+	for _, id := range ids {
+		a := f.auctions[id]
+		if a.Status != auction.StatusClosed {
+			continue
+		}
+		highest, ok := a.HighestBid()
+		if !ok || highest.BidderID != userID || !a.ReserveMet() {
+			continue
+		}
+		txn, ok := f.transactionByAuction(id)
+		if !ok {
+			continue
+		}
+		all = append(all, auction.PurchaseItem{
+			ListItem: auction.ListItem{
+				ID:                 a.ID,
+				SellerID:           a.SellerID,
+				Title:              a.Title,
+				Description:        a.Description,
+				StartingPriceCents: a.StartingPriceCents,
+				CurrentPriceCents:  a.CurrentPrice(),
+				MinIncrementCents:  a.MinIncrementCents,
+				ReserveMet:         true, // a won auction is sold by definition
+				BidCount:           a.BidCount(),
+				Status:             a.Status,
+				EndsAt:             a.EndsAt,
+				CreatedAt:          a.CreatedAt,
+				ClosedAt:           closedAtOf(a),
+			},
+			Transaction: *txn,
+		})
+	}
+
+	total := len(all)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return all[start:end], total, nil
+}
+
+// SellerSales mirrors the production aggregate over the fake store.
+func (f *fakeAuctionRepo) SellerSales(_ context.Context, sellerID string) (int, int, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	completed, pending := 0, 0
+	var revenue int64
+	for _, t := range f.transactions {
+		a, ok := f.auctions[t.AuctionID]
+		if !ok || a.SellerID != sellerID {
+			continue
+		}
+		switch t.Status {
+		case auction.TransactionCompleted:
+			completed++
+			revenue += t.AmountCents
+		case auction.TransactionPending:
+			pending++
+		}
+	}
+	return completed, pending, revenue, nil
 }
 
 func closedAtOf(a *auction.Auction) time.Time {

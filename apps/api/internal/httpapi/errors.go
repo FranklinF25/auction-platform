@@ -54,6 +54,10 @@ func (s *Server) writeDomainError(w http.ResponseWriter, err error) {
 		// Repositories wrap the sentinel with the concrete numbers (minimum
 		// acceptable, current price, increment), so err.Error() is actionable.
 		writeError(w, http.StatusConflict, "bid_too_low", err.Error())
+	case errors.Is(err, auction.ErrTransactionCompleted):
+		writeError(w, http.StatusConflict, "transaction_completed", "this transaction is already paid")
+	case errors.Is(err, auction.ErrTransactionExpired):
+		writeError(w, http.StatusConflict, "transaction_expired", "the payment window for this transaction has closed")
 	case errors.Is(err, auth.ErrEmailTaken):
 		writeError(w, http.StatusConflict, "email_taken", "that email is already registered")
 	case errors.Is(err, auth.ErrInvalidCredentials):

@@ -396,10 +396,28 @@ FOR UPDATE`, id))
 		return nil, err
 	}
 
+	// M4 checkout: a sold close creates the pending payment in the same locked
+	// transaction — amount is the final price at close, and the winner has 48
+	// hours to pay. The UNIQUE index on auction_id backstops double-creation.
+	var txn *auction.Transaction
+	if won {
+		txn = &auction.Transaction{
+			AuctionID:   a.ID,
+			WinnerID:    winner.BidderID,
+			AmountCents: a.CurrentPrice(),
+			Status:      auction.TransactionPending,
+			CreatedAt:   now,
+			ExpiresAt:   now.Add(auction.TransactionExpiryDuration),
+		}
+		if err := insertTransaction(ctx, tx, txn); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &auction.ClosedAuction{Auction: a, Winner: winner, Won: won}, nil
+	return &auction.ClosedAuction{Auction: a, Winner: winner, Won: won, Transaction: txn}, nil
 }
 
 // wonTopBid is the shared CTE picking each auction's winning bid: the highest
@@ -474,4 +492,52 @@ func escapeLike(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `%`, `\%`)
 	return strings.ReplaceAll(s, `_`, `\_`)
+}
+
+// SeedAuction inserts an auction together with its full historical state —
+// status, ends_at, created_at, closed_at and the bid history with explicit
+// timestamps — inside one transaction, and loads the stored bids (IDs
+// assigned) into the aggregate. It exists for the demo seed, which must
+// construct finished auctions (closed, sold, already paid) that the
+// create/place-bid/close lifecycle cannot express; every normal write still
+// goes through Create and PlaceBid. The caller is responsible for passing a
+// bid history that respects the domain rules (the seed package validates).
+func (r *AuctionRepository) SeedAuction(ctx context.Context, a *auction.Auction, bids []auction.Bid) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // no-op after commit
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO auctions (seller_id, title, description, starting_price_cents,
+		                      min_increment_cents, reserve_price_cents, status, ends_at,
+		                      created_at, closed_at)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id`,
+		a.SellerID, a.Title, a.Description, a.StartingPriceCents,
+		a.MinIncrementCents, a.ReservePriceCents, string(a.Status), a.EndsAt,
+		a.CreatedAt, a.ClosedAt,
+	).Scan(&a.ID)
+	if err != nil {
+		return err
+	}
+
+	for i := range bids {
+		bids[i].AuctionID = a.ID
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO bids (auction_id, bidder_id, amount_cents, created_at)
+			VALUES ($1::uuid, $2::uuid, $3, $4)
+			RETURNING id`,
+			bids[i].AuctionID, bids[i].BidderID, bids[i].AmountCents, bids[i].CreatedAt,
+		).Scan(&bids[i].ID); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	a.LoadBids(bids)
+	return nil
 }

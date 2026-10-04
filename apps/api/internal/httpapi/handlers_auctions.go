@@ -145,7 +145,8 @@ func (s *Server) handleListMyAuctions(w http.ResponseWriter, r *http.Request) {
 
 // handleListMyPurchases serves the buyer dashboard: auctions the
 // authenticated user has won (closed, sold, highest bidder), newest close
-// first. Losing bids and unsold (reserve-not-met) auctions never appear.
+// first, each joined with its checkout transaction (M4). Losing bids and
+// unsold (reserve-not-met) auctions never appear.
 func (s *Server) handleListMyPurchases(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
 	page, pageSize, ok := s.parsePaging(w, r.URL.Query())
@@ -158,7 +159,13 @@ func (s *Server) handleListMyPurchases(w http.ResponseWriter, r *http.Request) {
 		s.writeDomainError(w, err)
 		return
 	}
-	writeListItemPage(w, result)
+	items := make([]purchaseItemResponse, 0, len(result.Items))
+	for _, it := range result.Items {
+		items = append(items, newPurchaseItemResponse(it))
+	}
+	writeJSON(w, http.StatusOK, pageResponse[purchaseItemResponse]{
+		Items: items, Page: result.Page, PageSize: result.PageSize, Total: result.Total,
+	})
 }
 
 // parseListQuery reads the shared q/status/page/page_size list parameters
@@ -191,6 +198,39 @@ func writeListItemPage(w http.ResponseWriter, result auction.Page[auction.ListIt
 	writeJSON(w, http.StatusOK, pageResponse[auctionResponse]{
 		Items: items, Page: result.Page, PageSize: result.PageSize, Total: result.Total,
 	})
+}
+
+// transactionResponse is the checkout view embedded in a purchase item:
+// payment status, the amount owed and the remaining payment window. The
+// auction id and winner id are deliberately absent — the enclosing item
+// already identifies the lot, and the winner is the requesting user.
+type transactionResponse struct {
+	ID          string     `json:"id"`
+	Status      string     `json:"status"`
+	AmountCents int64      `json:"amount_cents"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	PaidAt      *time.Time `json:"paid_at"`
+}
+
+// purchaseItemResponse is the M4 purchases item: the existing list-item
+// representation plus the checkout transaction. Additive only — every prior
+// field keeps its name and shape.
+type purchaseItemResponse struct {
+	auctionResponse
+	Transaction transactionResponse `json:"transaction"`
+}
+
+func newPurchaseItemResponse(it auction.PurchaseItem) purchaseItemResponse {
+	return purchaseItemResponse{
+		auctionResponse: newListItemResponse(it.ListItem),
+		Transaction: transactionResponse{
+			ID:          it.Transaction.ID,
+			Status:      string(it.Transaction.Status),
+			AmountCents: it.Transaction.AmountCents,
+			ExpiresAt:   it.Transaction.ExpiresAt,
+			PaidAt:      it.Transaction.PaidAt,
+		},
+	}
 }
 
 func (s *Server) handleGetAuction(w http.ResponseWriter, r *http.Request) {

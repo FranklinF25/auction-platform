@@ -97,6 +97,32 @@ func (f *placeBidRepo) ListWon(_ context.Context, _ string, _, _ int) ([]auction
 	return nil, 0, nil
 }
 
+// M4 port additions: this fake only exercises the bid hot path, so the
+// transaction surface is a minimal honest stub.
+func (f *placeBidRepo) CreateTransaction(_ context.Context, _ *auction.Transaction) error {
+	return nil
+}
+
+func (f *placeBidRepo) TransactionByID(_ context.Context, _ string) (*auction.Transaction, error) {
+	return nil, auction.ErrNotFound
+}
+
+func (f *placeBidRepo) PayTransaction(_ context.Context, _ string, _ string, _ time.Time) (*auction.Transaction, error) {
+	return nil, auction.ErrNotFound
+}
+
+func (f *placeBidRepo) ExpireDueTransactions(_ context.Context, _ time.Time) (int, error) {
+	return 0, nil
+}
+
+func (f *placeBidRepo) ListMyTransactions(_ context.Context, _ string, _, _ int) ([]auction.PurchaseItem, int, error) {
+	return nil, 0, nil
+}
+
+func (f *placeBidRepo) SellerSales(_ context.Context, _ string) (int, int, int64, error) {
+	return 0, 0, 0, nil
+}
+
 func (f *placeBidRepo) PlaceBid(_ context.Context, auctionID, bidderID string, amountCents int64, now time.Time) (*auction.PlacedBid, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

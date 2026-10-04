@@ -96,16 +96,48 @@ func (s *Service) ListBids(ctx context.Context, auctionID string, page, pageSize
 	return Page[Bid]{Items: bids, Page: page, PageSize: pageSize, Total: total}, nil
 }
 
-// ListPurchases returns one page of the auctions the user has won (closed,
-// sold, highest bidder), newest close first. It backs the purchases
-// dashboard; losing bids and unsold (reserve-not-met) auctions never appear.
-func (s *Service) ListPurchases(ctx context.Context, userID string, page, pageSize int) (Page[ListItem], error) {
+// ListPurchases returns one page of the user's purchases — won auctions
+// joined with their checkout transaction, newest close first — backing the
+// purchases dashboard. Losing bids and unsold (reserve-not-met) auctions
+// never appear; the embedded Transaction carries payment status and window.
+func (s *Service) ListPurchases(ctx context.Context, userID string, page, pageSize int) (Page[PurchaseItem], error) {
 	page, pageSize = normalizePaging(page, pageSize)
-	items, total, err := s.repo.ListWon(ctx, userID, page, pageSize)
+	items, total, err := s.repo.ListMyTransactions(ctx, userID, page, pageSize)
 	if err != nil {
-		return Page[ListItem]{}, err
+		return Page[PurchaseItem]{}, err
 	}
-	return Page[ListItem]{Items: items, Page: page, PageSize: pageSize, Total: total}, nil
+	return Page[PurchaseItem]{Items: items, Page: page, PageSize: pageSize, Total: total}, nil
+}
+
+// SellerSales aggregates the authenticated seller's sales for the seller
+// dashboard: completed count, still-pending count and completed revenue.
+func (s *Service) SellerSales(ctx context.Context, sellerID string) (int, int, int64, error) {
+	return s.repo.SellerSales(ctx, sellerID)
+}
+
+// PayTransaction simulates one payment attempt by the authenticated user on
+// their own transaction. Ownership first: a transaction that exists but
+// belongs to another winner reports ErrNotFound — no existence leak. The
+// payment itself is owned by the repository (locked row, pure Transaction.Pay,
+// persist, commit) exactly like PlaceBid; nothing is published (the PRD's
+// payment flow has no realtime requirement). A declined card returns the
+// failed transaction with a nil error.
+func (s *Service) PayTransaction(ctx context.Context, userID, transactionID, cardNumber string) (*Transaction, error) {
+	t, err := s.repo.TransactionByID(ctx, transactionID)
+	if err != nil {
+		return nil, err
+	}
+	if t.WinnerID != userID {
+		return nil, ErrNotFound // another user's transaction is indistinguishable from a missing one
+	}
+	return s.repo.PayTransaction(ctx, transactionID, cardNumber, s.clock.Now())
+}
+
+// ExpireDueTransactions is the M4 expiry use case driven by the expiry
+// worker: move every pending/failed transaction whose payment window has
+// passed to expired. It returns how many rows the sweep moved.
+func (s *Service) ExpireDueTransactions(ctx context.Context) (int, error) {
+	return s.repo.ExpireDueTransactions(ctx, s.clock.Now())
 }
 
 // CloseDue is the M3 use case driven by the closer worker: close every

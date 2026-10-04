@@ -92,6 +92,8 @@ func New(authSvc *auth.Service, auctionSvc *auction.Service, h wsHub, now func()
 		// The M3 dashboards: the seller's own auctions and the buyer's wins.
 		r.Get("/users/me/auctions", s.requireAuth(s.handleListMyAuctions))
 		r.Get("/users/me/purchases", s.requireAuth(s.handleListMyPurchases))
+		// The M4 seller sales summary (checkout aggregates).
+		r.Get("/users/me/sales", s.requireAuth(s.handleMySales))
 
 		r.Post("/auctions", s.requireAuth(s.handleCreateAuction))
 		r.Get("/auctions", s.handleListAuctions)
@@ -99,6 +101,8 @@ func New(authSvc *auth.Service, auctionSvc *auction.Service, h wsHub, now func()
 		r.Get("/auctions/{id}/bids", s.handleListBids)
 		// The bid hot path: transactional DB write + post-commit broadcast.
 		r.Post("/auctions/{id}/bids", s.requireAuth(s.handlePlaceBid))
+		// The M4 checkout: simulated payment on the winner's transaction.
+		r.Post("/transactions/{id}/pay", s.requireAuth(s.handlePayTransaction))
 	})
 
 	return r
